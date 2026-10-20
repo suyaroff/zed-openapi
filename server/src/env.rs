@@ -1,11 +1,9 @@
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ENV_FILE: &str = "http-client.env.json";
-const PRIVATE_ENV_FILE: &str = "http-client.private.env.json";
 const STATE_FILE: &str = ".openapi/state.json";
 
 #[derive(Default)]
@@ -145,21 +143,6 @@ fn read_json(path: &Path) -> Option<Map<String, Value>> {
     serde_json::from_str::<Value>(&text).ok()?.as_object().cloned()
 }
 
-fn find_upwards(start: &Path, root: &Path, name: &str) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        let candidate = d.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if d == root {
-            break;
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 fn to_string_map(v: Option<&Value>, out: &mut HashMap<String, String>) {
     if let Some(obj) = v.and_then(Value::as_object) {
         for (k, v) in obj {
@@ -173,27 +156,19 @@ fn to_string_map(v: Option<&Value>, out: &mut HashMap<String, String>) {
 }
 
 /// Picks the configured env, else `dev`, else the first one declared.
-pub fn load_env(file_dir: &Path, root: &Path, wanted: Option<&str>) -> (String, HashMap<String, String>) {
-    let public = find_upwards(file_dir, root, ENV_FILE).and_then(|p| read_json(&p));
-    let private = find_upwards(file_dir, root, PRIVATE_ENV_FILE).and_then(|p| read_json(&p));
-    let names: Vec<&String> = public
-        .iter()
-        .chain(private.iter())
-        .flat_map(|m| m.keys())
-        .filter(|k| !k.starts_with('$'))
-        .collect();
+pub fn load_env(
+    wanted: Option<&str>,
+    vars: &Map<String, Value>,
+    envs: &Map<String, Value>,
+) -> (String, HashMap<String, String>) {
     let name = wanted
         .map(str::to_string)
-        .or_else(|| names.iter().find(|n| n.as_str() == "dev").map(|n| n.to_string()))
-        .or_else(|| names.first().map(|n| n.to_string()))
+        .or_else(|| envs.contains_key("dev").then(|| "dev".to_string()))
+        .or_else(|| envs.keys().next().cloned())
         .unwrap_or_else(|| "default".into());
     let mut out = HashMap::new();
-    for m in [&public, &private].into_iter().flatten() {
-        to_string_map(m.get("$shared"), &mut out);
-    }
-    for m in [&public, &private].into_iter().flatten() {
-        to_string_map(m.get(&name), &mut out);
-    }
+    to_string_map(Some(&Value::Object(vars.clone())), &mut out);
+    to_string_map(envs.get(&name), &mut out);
     (name, out)
 }
 

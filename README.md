@@ -26,7 +26,12 @@ cargo install --path server          # ставит openapi-lsp в ~/.cargo/bin
     "openapi-lsp": {
       "settings": {
         "spec": "docs/API/openapi.json",
-        "env": "dev"
+        "env": "dev",
+        "vars": { "locale": "ru" },
+        "envs": {
+          "dev":  { "baseUrl": "http://reg.napp.local/api" },
+          "prod": { "baseUrl": "https://reg.napp.uz/api", "token": "{{$env.PROD_TOKEN}}" }
+        }
       }
     }
   }
@@ -36,8 +41,9 @@ cargo install --path server          # ставит openapi-lsp в ~/.cargo/bin
 | Ключ | По умолчанию | |
 |---|---|---|
 | `spec` | автопоиск `openapi.{json,yaml}` | путь от корня проекта; в файле можно переопределить через `# @spec ../path.json` |
-| `env` | `dev`, иначе первое окружение | окружение из `http-client.env.json` |
-| `responsesDir` | `.openapi/responses` | |
+| `env` | `dev`, иначе первое окружение | окружение из `envs` |
+| `vars`, `envs` | — | переменные и окружения (см. пример выше) |
+| `responsesDir` | `.openapi/responses` | куда сохранять ответы: путь от корня проекта (или абсолютный) |
 | `timeout` | `30` | секунды |
 | `defaultAccept` | `application/json` | добавляется, если нет `Accept`; `null` — не добавлять |
 | `focusResponse` | `false` | переводить фокус на ответ |
@@ -47,39 +53,135 @@ cargo install --path server          # ставит openapi-lsp в ~/.cargo/bin
 
 Если `openapi-lsp` не в `PATH`, путь задаётся в `lsp.openapi-lsp.binary.path`.
 
-Окружения — `http-client.env.json` (секреты кладите в `http-client.private.env.json`). Файл ищется от папки `.http`-файла вверх до корня проекта:
-
-```json
-{
-  "$shared": { "locale": "ru" },
-  "dev":  { "baseUrl": "http://reg.napp.local/api" },
-  "prod": { "baseUrl": "https://reg.napp.uz/api" }
-}
-```
+`envs` — окружения, `vars` — переменные, общие для всех окружений. Секреты берите через `{{$env.X}}` или кладите в пользовательский `~/.config/zed/settings.json`.
 
 Если `baseUrl` не задан, берётся `servers[0].url` из спека.
 
 ## Формат `.http`
 
+### Разделение запросов
+
+Запросы разделяются строкой `###`; текст после неё — просто заголовок блока. Над каждым блоком появляется code lens **▶ Send**.
+
+```http
+### Login
+POST {{baseUrl}}/login
+Content-Type: application/json
+
+{ "email": "admin@example.com", "password": "secret" }
+
+### Profile
+GET {{baseUrl}}/v1/profile
+```
+
+Метод можно опустить — тогда это `GET`. Длинный query можно переносить, продолжение начинается с отступа и `?` / `&`:
+
+```http
+GET {{baseUrl}}/v1/users
+  ?page=1
+  &limit=20
+```
+
+Комментарии — строки с `#` или `//`.
+
+### Переменные
+
+Переменные в файле объявляются строкой `@name = value` и действуют на весь файл. Остальные источники — `vars` / `envs` из настроек и значения, сохранённые через `@capture`.
+
 ```http
 @email = admin@example.com
+@baseUrl = http://localhost:8080/api
 
 ### Login
-# @name login
-# @capture token = data.token
 POST {{baseUrl}}/login
 Content-Type: application/json
 
 { "email": "{{email}}", "password": "secret" }
+```
 
-### Profile — Authorization: Bearer {{token}} подставится сам
+Порядок: `@var` в файле → сохранённые `@capture` → `envs[env]` → `vars` → `baseUrl` из `servers[0]` спека.
+
+Динамические переменные:
+
+```http
+POST {{baseUrl}}/v1/orders
+X-Request-ID: {{$uuid}}
+X-Sent-At: {{$timestamp}}
+X-Nonce: {{$randomInt}}
+Authorization: Bearer {{$env.API_TOKEN}}
+```
+
+### Имя запроса и захват значений
+
+`# @name` задаёт имя файла ответа (иначе `METHOD_path.http`). `# @capture var = dot.path` после успешного (2xx) ответа сохраняет поле ответа в `.openapi/state.json` — отдельно для каждого окружения и для всех файлов проекта.
+
+```http
+### Login
+# @name login
+# @capture token = data.token
+# @capture userId = data.user.id
+POST {{baseUrl}}/login
+Content-Type: application/json
+
+{ "email": "admin@example.com", "password": "secret" }
+
+### Мой профиль
+GET {{baseUrl}}/v1/users/{{userId}}
+```
+
+Путь — через точки, элементы массива по индексу: `data.items.0.id`.
+
+### Авторизация
+
+Если у операции в спеке есть `security` (bearer / oauth) и заголовка `Authorization` нет, добавляется `Authorization: Bearer {{token}}`. Чтобы переопределить, напишите заголовок сами:
+
+```http
 GET {{baseUrl}}/v1/profile
-Accept-Language: {{locale}}
+Authorization: Bearer {{adminToken}}
+```
 
-### Upload
+### Тело запроса
+
+JSON с подсказками по схеме из спека:
+
+```http
+POST {{baseUrl}}/v1/users
+Content-Type: application/json
+
+{
+  "name": "Ivan",
+  "role": "admin"
+}
+```
+
+Форма:
+
+```http
+POST {{baseUrl}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=password&username=admin&password=secret
+```
+
+Файл целиком как тело:
+
+```http
+POST {{baseUrl}}/v1/import
+Content-Type: application/json
+
+< ./fixtures/users.json
+```
+
+Multipart с файлом:
+
+```http
 POST {{baseUrl}}/v1/uploads
 Content-Type: multipart/form-data; boundary=boundary
 
+--boundary
+Content-Disposition: form-data; name="title"
+
+Contract
 --boundary
 Content-Disposition: form-data; name="file"; filename="doc.pdf"
 
@@ -87,11 +189,17 @@ Content-Disposition: form-data; name="file"; filename="doc.pdf"
 --boundary--
 ```
 
-- `# @capture var = dot.path` после успешного (2xx) ответа сохраняет значение в `.openapi/state.json`, отдельно для каждого окружения. Сохранённые значения доступны во всех файлах.
-- Bearer-токен из `{{token}}` подставляется автоматически, если у операции есть `security` и явного `Authorization` нет.
-- Динамические переменные: `{{$uuid}}`, `{{$timestamp}}`, `{{$randomInt}}`, `{{$env.NAME}}`.
-- `< ./file` подставляет содержимое файла: целиком как тело или внутри multipart.
-- Бинарные ответы (pdf, xlsx и т.п.) сохраняются рядом с файлом ответа.
+### Другой спек для файла
+
+```http
+# @spec ../other-service/openapi.yaml
+```
+
+Директива действует на весь файл и переопределяет настройку `spec`.
+
+### Ответы
+
+Ответ сохраняется в `<responsesDir>/<name>.http` и открывается в редакторе. Бинарные ответы (pdf, xlsx и т. п.) сохраняются рядом с файлом ответа. Файл, где первый блок начинается с `HTTP/…`, считается ответом: запросов в нём нет.
 
 ## Структура
 

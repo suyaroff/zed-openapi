@@ -40,6 +40,8 @@ const CMD_OPEN: &str = "openapi.openResponse";
 struct Settings {
     spec: Option<String>,
     env: Option<String>,
+    vars: serde_json::Map<String, Value>,
+    envs: serde_json::Map<String, Value>,
     responses_dir: String,
     timeout: u64,
     default_accept: Option<String>,
@@ -52,6 +54,8 @@ impl Default for Settings {
         Self {
             spec: None,
             env: None,
+            vars: Default::default(),
+            envs: Default::default(),
             responses_dir: ".openapi/responses".into(),
             timeout: 30,
             default_accept: Some("application/json".into()),
@@ -209,10 +213,11 @@ impl Server {
 
     fn ctx_for(&self, uri: &Uri, file: &HttpFile, spec: Option<&Spec>) -> Ctx {
         let root = self.root_for(uri);
-        let dir = uri_to_path(uri)
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| root.clone());
-        let (env_name, env) = env::load_env(&dir, &root, self.settings.env.as_deref());
+        let (env_name, env) = env::load_env(
+            self.settings.env.as_deref(),
+            &self.settings.vars,
+            &self.settings.envs,
+        );
         Ctx {
             captured: env::load_captured(&root, &env_name),
             env_name,

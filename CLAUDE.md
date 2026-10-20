@@ -41,7 +41,7 @@ The document text is re-parsed on every request; there is no incremental state. 
   - `find` matches a raw URL to an operation by **suffix-matching path segments**, so `{{baseUrl}}`, a host or a base path like `/api` in front don't matter. More segments win, then more literal segments. The result distinguishes `Exact` from `WrongMethod`;
   - `object_view` merges `allOf`, and `child` / `schema_at` walk a JSON path through the schema.
 - `json_scan.rs` — tolerant scanner for incomplete JSON bodies containing `{{vars}}`. It yields key positions (used by diagnostics) and the cursor context (used by hover and completion).
-- `env.rs` — variable resolution. Order: file `@vars` > captured state (`.openapi/state.json`, per env) > `http-client.env.json` / `.private.env.json` (searched upward from the file's dir; `$shared` merged first) > `baseUrl` fallback from `servers[0]`. Dynamic `{{$uuid}}`, `{{$timestamp}}`, `{{$randomInt}}`, `{{$env.X}}`.
+- `env.rs` — variable resolution. Order: file `@vars` > captured state (`.openapi/state.json`, per env) > settings `envs[env]` > settings `vars` > `baseUrl` fallback from `servers[0]`. Dynamic `{{$uuid}}`, `{{$timestamp}}`, `{{$randomInt}}`, `{{$env.X}}`.
 - `render.rs` (hover markdown), `completion.rs`, `diagnostics.rs` — consumers of the modules above.
 - `runner.rs` — `prepare` substitutes vars, prefixes relative URLs with `baseUrl`, auto-adds `Authorization: Bearer {{token}}` when the matched operation has bearer/oauth security, adds a default `Accept`, and expands `< ./file` includes (multipart bodies are converted to CRLF). `run` writes `<responsesDir>/<name|METHOD_path>.http` and saves captures.
 
