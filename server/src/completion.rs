@@ -13,12 +13,69 @@ use std::collections::BTreeSet;
 
 const COMMON_HEADERS: &[&str] = &[
     "Accept",
+    "Accept-Charset",
+    "Accept-Encoding",
     "Accept-Language",
     "Authorization",
+    "Cache-Control",
+    "Connection",
+    "Content-Disposition",
+    "Content-Encoding",
+    "Content-Language",
+    "Content-Length",
     "Content-Type",
     "Cookie",
+    "DNT",
+    "Host",
+    "If-Match",
+    "If-Modified-Since",
+    "If-None-Match",
+    "Origin",
+    "Pragma",
+    "Range",
+    "Referer",
     "User-Agent",
+    "X-API-Key",
+    "X-Correlation-ID",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Request-ID",
     "X-Requested-With",
+];
+
+const MIME_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "application/x-www-form-urlencoded",
+    "application/octet-stream",
+    "application/pdf",
+    "multipart/form-data",
+    "text/plain",
+    "text/html",
+    "text/csv",
+    "image/png",
+    "image/jpeg",
+    "*/*",
+];
+
+const STATIC_VALUES: &[(&str, &[&str])] = &[
+    (
+        "accept-language",
+        &["ru", "ru-RU", "en", "en-US", "en-GB", "uz", "uz-UZ", "uz-Cyrl", "uz-Latn", "tr", "de", "fr", "es", "zh-CN", "*"],
+    ),
+    ("content-language", &["ru", "ru-RU", "en", "en-US", "uz", "uz-UZ"]),
+    ("accept-encoding", &["gzip", "deflate", "br", "gzip, deflate, br", "identity"]),
+    ("content-encoding", &["gzip", "deflate", "br", "identity"]),
+    ("accept-charset", &["utf-8", "iso-8859-1", "*"]),
+    ("cache-control", &["no-cache", "no-store", "max-age=0", "max-age=3600", "must-revalidate", "public", "private"]),
+    ("connection", &["keep-alive", "close"]),
+    ("pragma", &["no-cache"]),
+    ("x-requested-with", &["XMLHttpRequest"]),
+    ("x-forwarded-proto", &["https", "http"]),
+    ("dnt", &["1", "0"]),
+    ("x-request-id", &["{{$uuid}}"]),
+    ("x-correlation-id", &["{{$uuid}}"]),
 ];
 
 struct Cx<'a> {
@@ -62,6 +119,13 @@ pub fn complete(
     match req {
         Some(r) if r.line == line => request_line(&cx, r, before, spec),
         Some(r) if line > r.line && line < r.headers_end => header(&cx, r, before, spec),
+        Some(r)
+            if line == r.headers_end
+                && line > r.line
+                && !before.trim_start().starts_with(['{', '[', '"', '-', '<']) =>
+        {
+            header(&cx, r, before, spec)
+        }
         Some(r) if r.body.as_ref().is_some_and(|b| line >= b.start_line) => body(&cx, r, spec),
         Some(r) if line > r.line && line >= r.headers_end => {
             let mut v = Vec::new();
@@ -339,11 +403,13 @@ fn header(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Vec<Comp
                 {
                     values.extend(content.keys().cloned());
                 }
-                values.push("application/json".into());
+                values.extend(MIME_TYPES.iter().map(|m| m.to_string()));
             } else if name.eq_ignore_ascii_case("authorization") {
                 values.push("Bearer {{token}}".into());
             } else if name.eq_ignore_ascii_case("accept") {
-                values.push("application/json".into());
+                values.extend(MIME_TYPES.iter().map(|m| m.to_string()));
+            } else if let Some((_, vs)) = STATIC_VALUES.iter().find(|(h, _)| name.eq_ignore_ascii_case(h)) {
+                values.extend(vs.iter().map(|v| v.to_string()));
             }
             if let Some((s, op)) = op {
                 for p in s.params(op) {
