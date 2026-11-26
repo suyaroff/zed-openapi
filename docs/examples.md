@@ -51,6 +51,8 @@ GET /bearer
 
 Ответ на второй запрос — `{"authenticated": true, "token": "secret-123"}`, хотя `Authorization` в нём не написан. Токен хранится в `.openapi/state.json` отдельно для каждого окружения и виден во всех `.http`-файлах проекта.
 
+Чтобы не запускать логин вручную, добавьте в начало файла `# @auth login`: логин выполнится сам, если токена ещё нет или сервер ответил 401 — см. [Автологин](sending.md#автологин-auth).
+
 На реальном API путь обычно глубже: `# @capture token = data.access_token`, элемент массива — `data.items.0.id`.
 
 ## Несколько окружений
@@ -240,3 +242,32 @@ GET {{billingUrl}}/v1/invoices
 ```
 
 Hover, completion и diagnostics в этом файле берутся из указанного спека.
+
+## Сессия на cookies
+
+```http
+### Login
+# @name login
+GET /cookies/set?session=abc123
+
+### Cookie уходит сам
+GET /cookies
+```
+
+httpbin ставит cookie `session` (через редирект), второй запрос отправляет его — видно в `# > Cookie: session=abc123` и в ответе. Очистить — code action **Clear cookies**.
+
+## Таймаут и редирект для одного запроса
+
+```http
+### Ждать дольше обычного
+# @timeout 2m
+GET /delay/10
+
+### Посмотреть сам редирект, не следуя ему
+# @no-redirect
+GET /redirect-to?url=/anything&status_code=302
+```
+
+## Сгенерировать запросы из спека
+
+Создайте пустой `users.http`, поставьте курсор в файл и выберите code action **Generate N requests for tag `users`** — в файл добавятся все операции тега с телами из схемы.

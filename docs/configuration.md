@@ -30,6 +30,7 @@
 | `timeout` | `30` | секунды |
 | `defaultAccept` | `application/json` | добавляется, если нет `Accept`; `null` — не добавлять |
 | `focusResponse` | `false` | переводить фокус на ответ |
+| `cookieJar` | `true` | хранить cookies между запросами — см. [Cookies](sending.md#cookies) |
 | `insecure` | `false` | не проверять TLS-сертификат (по умолчанию используется системное хранилище, так что mkcert и подобные работают) |
 
 ## Окружения и переменные
