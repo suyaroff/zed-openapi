@@ -513,10 +513,16 @@ impl Server {
         for (name, s, e) in env::var_names_in(line) {
             if (s..e).contains(&col) {
                 let ctx = self.ctx_for(&uri, &file, spec.as_deref());
-                let value = match ctx.raw(&name) {
-                    Some(v) => format!("`{name}` = `{}`", ctx.substitute(v).unwrap_or_else(|_| v.to_string())),
-                    None if name.starts_with('$') => format!("`{name}` — dynamic value"),
-                    None => format!("`{name}` is not defined in env `{}`", ctx.env_name),
+                let value = match (ctx.raw(&name), ctx.missing(&name)) {
+                    (Some(v), _) => match ctx.substitute(v) {
+                        Ok(resolved) => format!("`{name}` = `{resolved}`"),
+                        Err(missing) => {
+                            let names: Vec<String> = missing.iter().map(|m| format!("`{m}`")).collect();
+                            format!("`{name}` = `{v}`\n\n⚠ unresolved: {}", names.join(", "))
+                        }
+                    },
+                    (None, None) => format!("`{name}` — dynamic value"),
+                    (None, Some(m)) => m.message(&name, &ctx.env_name),
                 };
                 return Some(markdown_hover(value));
             }

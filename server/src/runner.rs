@@ -18,7 +18,8 @@ pub struct Prepared {
     pub spec_path: Option<PathBuf>,
     /// The jar owns the `Cookie` header (the request didn't set one): recomputed on every hop.
     pub jar_cookie: bool,
-    pub expects: Vec<String>,
+    /// `@expect`s after `{{var}}` substitution; `Err` keeps the raw expression and the error.
+    pub expects: Vec<Result<String, (String, String)>>,
 }
 
 pub struct Outcome {
@@ -157,7 +158,7 @@ pub fn prepare(
         stem: stem_for(req),
         spec_path: None,
         jar_cookie: false,
-        expects: req.opts.expects.iter().map(|(_, e)| ctx.substitute(e).unwrap_or_else(|_| e.clone())).collect(),
+        expects: req.opts.expects.iter().map(|(_, e)| ctx.substitute(e).map_err(|m| (e.clone(), undefined(m)))).collect(),
     })
 }
 

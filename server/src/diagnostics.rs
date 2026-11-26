@@ -1,7 +1,7 @@
-use crate::env::{var_names_in, Ctx};
+use crate::env::{var_names_in, Ctx, Missing, DYNAMIC_NAMES};
 use crate::http_parser::{parse_var, HttpFile, Request};
 use crate::json_scan::{self, Node, NodeKind};
-use crate::spec::{Match, PathElem, Spec};
+use crate::spec::{levenshtein, Match, PathElem, Spec};
 use crate::util::{byte_to_lsp, full_line, range_on_line, split_lines};
 use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, TextEdit};
 use serde_json::Value;
@@ -66,24 +66,54 @@ pub fn compute(text: &str, file: &HttpFile, spec: Option<&Spec>, ctx: &Ctx) -> V
         if let Some(spec) = spec {
             check_request(&lines, req, spec, &mut out);
         }
-        let last = req.end_line.min(lines.len().saturating_sub(1));
-        for (i, line) in lines.iter().enumerate().take(last + 1).skip(req.line) {
-            for (name, s, e) in var_names_in(line) {
-                if !ctx.is_defined(&name) && !captured_here.contains(&name.as_str()) {
-                    let mut f = finding(
-                        range_on_line(&lines, i, s, e),
-                        format!("Variable `{name}` is not defined in env `{}`", ctx.env_name),
-                    );
-                    if !name.starts_with('$') {
-                        let edit = insert(var_anchor, format!("@{name} = \n"));
-                        f.fixes.push(fix(format!("Define `@{name}` in this file"), vec![edit], true));
-                    }
-                    out.push(f);
-                }
+    }
+
+    // Lines whose `{{vars}}` are substituted when sending: requests, `@expect`s, `@var` values.
+    let mut var_lines: Vec<usize> = Vec::new();
+    for req in &file.requests {
+        var_lines.extend(req.line..=req.end_line.min(lines.len().saturating_sub(1)));
+        var_lines.extend(req.opts.expects.iter().map(|(l, _)| *l));
+    }
+    let in_request = |i: usize| file.requests.iter().any(|r| (r.line..=r.end_line).contains(&i));
+    var_lines.extend((0..lines.len()).filter(|&i| !in_request(i) && parse_var(lines[i].trim()).is_some()));
+    var_lines.sort_unstable();
+    var_lines.dedup();
+
+    for i in var_lines {
+        for (name, s, e) in var_names_in(lines[i]) {
+            if captured_here.contains(&name.as_str()) {
+                continue;
             }
+            let Some(missing) = ctx.missing(&name) else { continue };
+            let range = range_on_line(&lines, i, s, e);
+            let mut f = finding(range, missing.message(&name, &ctx.env_name));
+            match missing {
+                Missing::Var => {
+                    let edit = insert(var_anchor, format!("@{name} = \n"));
+                    f.fixes.push(fix(format!("Define `@{name}` in this file"), vec![edit], true));
+                }
+                Missing::UnknownDynamic => {
+                    if let Some(known) = closest_dynamic(&name) {
+                        let edit = TextEdit { range, new_text: format!("{{{{{known}}}}}") };
+                        f.fixes.push(fix(format!("Change to `{known}`"), vec![edit], true));
+                    }
+                }
+                Missing::EnvUnset(_) => {}
+            }
+            out.push(f);
         }
     }
     out
+}
+
+fn closest_dynamic(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    DYNAMIC_NAMES
+        .iter()
+        .map(|k| (levenshtein(&name, &k.to_ascii_lowercase()), *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
 }
 
 /// After the last `@var` line above the first request, else the top of the file.
@@ -408,10 +438,60 @@ mod tests {
     #[test]
     fn dynamic_and_captured_variables() {
         assert!(messages("GET {{baseUrl}}/pets/{{$randomInt}}\n").is_empty());
-        // Unknown `$` names are treated as dynamic and not reported.
-        assert!(messages("GET {{baseUrl}}/pets/{{$nope}}\n").is_empty());
         let text = "# @capture tok = data.token\nGET {{baseUrl}}/health\n\n###\nGET {{baseUrl}}/health\nAuthorization: Bearer {{tok}}\n";
         assert!(messages(text).is_empty());
+    }
+
+    #[test]
+    fn unknown_dynamic_variables() {
+        let text = "GET {{baseUrl}}/pets/{{$nope}}\n";
+        let f = only(text);
+        assert_eq!(
+            f.diag.message,
+            "Unknown dynamic variable `$nope`; supported: $uuid, $guid, $random.uuid, $timestamp, $randomInt, $env.NAME"
+        );
+        assert!(f.fixes.is_empty());
+
+        let text = "GET {{baseUrl}}/pets\nX-Request-ID: {{ $uuidd }}\n";
+        let f = run(text).into_iter().find(|f| f.diag.message.starts_with("Unknown dynamic")).unwrap();
+        assert_eq!(f.diag.range, rng(1, 14, 26));
+        assert_eq!(fixed(text, &f, "Change to `$uuid`"), "GET {{baseUrl}}/pets\nX-Request-ID: {{$uuid}}\n");
+        let f = only("GET {{baseUrl}}/pets/{{$RANDOMINT}}\n");
+        assert_eq!(f.fixes[0].title, "Change to `$randomInt`");
+
+        for ok in ["$uuid", "$guid", "$random.uuid", "$timestamp", "$randomInt 1 10", "$env.PATH", "$processEnv PATH"] {
+            assert!(messages(&format!("GET {{{{baseUrl}}}}/pets/{{{{{ok}}}}}\n")).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn unset_environment_variable() {
+        let f = only("GET {{baseUrl}}/pets/{{$env.OPENAPI_LSP_TEST_SURELY_UNSET}}\n");
+        assert_eq!(f.diag.message, "Environment variable `OPENAPI_LSP_TEST_SURELY_UNSET` is not set");
+        assert!(f.fixes.is_empty());
+        assert!(only("GET {{baseUrl}}/pets/{{$env}}\n").diag.message.starts_with("Unknown dynamic variable `$env`"));
+    }
+
+    #[test]
+    fn variable_values_are_checked() {
+        let text = "@id = {{petId}}\n@ts = {{$timestmp}}\n# @expect data.id == {{other}}\nGET {{baseUrl}}/pets/{{id}}\n";
+        let f = run(text);
+        let got: Vec<(&str, Range)> = f.iter().map(|f| (f.diag.message.as_str(), f.diag.range)).collect();
+        assert_eq!(
+            got,
+            [
+                ("Variable `petId` is not defined in env `dev`", rng(0, 6, 15)),
+                ("Unknown dynamic variable `$timestmp`; supported: $uuid, $guid, $random.uuid, $timestamp, $randomInt, $env.NAME", rng(1, 6, 19)),
+                ("Variable `other` is not defined in env `dev`", rng(2, 21, 30)),
+            ]
+        );
+        assert_eq!(
+            fixed(text, &f[0], "Define `@petId` in this file"),
+            "@id = {{petId}}\n@ts = {{$timestmp}}\n@petId = \n# @expect data.id == {{other}}\nGET {{baseUrl}}/pets/{{id}}\n"
+        );
+        assert_eq!(f[1].fixes[0].title, "Change to `$timestamp`");
+        // Plain comments are not substituted, so they are not checked.
+        assert!(messages("# see {{nothing}}\nGET {{baseUrl}}/health\n").is_empty());
     }
 
     #[test]

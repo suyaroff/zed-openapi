@@ -26,8 +26,16 @@ impl Ctx {
             .or_else(|| (name == "baseUrl").then_some(self.spec_base.as_deref()).flatten())
     }
 
-    pub fn is_defined(&self, name: &str) -> bool {
-        is_dynamic(name) || self.raw(name).is_some()
+    /// Why `{{name}}` has no value; `None` when it resolves.
+    pub fn missing(&self, name: &str) -> Option<Missing> {
+        if !is_dynamic(name) {
+            return self.raw(name).is_none().then_some(Missing::Var);
+        }
+        match parse_dynamic(name) {
+            None => Some(Missing::UnknownDynamic),
+            Some(Dynamic::Env(var)) if std::env::var_os(var).is_none() => Some(Missing::EnvUnset(var.to_string())),
+            Some(_) => None,
+        }
     }
 
     pub fn names(&self) -> Vec<(String, String)> {
@@ -101,8 +109,57 @@ pub fn var_names_in(text: &str) -> Vec<(String, usize, usize)> {
     out
 }
 
+/// Why a variable has no value, see `Ctx::missing`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Missing {
+    Var,
+    UnknownDynamic,
+    EnvUnset(String),
+}
+
+impl Missing {
+    pub fn message(&self, name: &str, env_name: &str) -> String {
+        match self {
+            Missing::Var => format!("Variable `{name}` is not defined in env `{env_name}`"),
+            Missing::UnknownDynamic => {
+                let known = DYNAMIC_NAMES.join(", ");
+                format!("Unknown dynamic variable `{name}`; supported: {known}, $env.NAME")
+            }
+            Missing::EnvUnset(var) => format!("Environment variable `{var}` is not set"),
+        }
+    }
+}
+
+/// Dynamic variables without arguments, for messages and "did you mean" fixes.
+pub const DYNAMIC_NAMES: &[&str] = &["$uuid", "$guid", "$random.uuid", "$timestamp", "$randomInt"];
+
 fn is_dynamic(name: &str) -> bool {
     name.starts_with('$')
+}
+
+enum Dynamic<'a> {
+    Uuid,
+    Timestamp,
+    RandomInt,
+    Env(&'a str),
+}
+
+/// `None` for names that are not supported dynamic variables.
+fn parse_dynamic(name: &str) -> Option<Dynamic<'_>> {
+    if name == "$random.uuid" {
+        return Some(Dynamic::Uuid);
+    }
+    let (head, arg) = match name.split_once(|c: char| c.is_whitespace() || c == '.') {
+        Some((h, a)) => (h, a.trim()),
+        None => (name, ""),
+    };
+    match head {
+        "$uuid" | "$guid" => Some(Dynamic::Uuid),
+        "$timestamp" => Some(Dynamic::Timestamp),
+        "$randomInt" => Some(Dynamic::RandomInt),
+        "$env" | "$processEnv" if !arg.is_empty() => Some(Dynamic::Env(arg)),
+        _ => None,
+    }
 }
 
 fn random_u64() -> u64 {
@@ -111,17 +168,15 @@ fn random_u64() -> u64 {
     h.finish()
 }
 
+/// `None` for non-`$` names; `Some(None)` for `$` names without a value.
 fn dynamic(name: &str) -> Option<Option<String>> {
     if !is_dynamic(name) {
         return None;
     }
-    let (head, arg) = match name.split_once(|c: char| c.is_whitespace() || c == '.') {
-        Some((h, a)) => (h, a.trim()),
-        None => (name, ""),
-    };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    Some(match head {
-        "$uuid" | "$random.uuid" | "$guid" => {
+    let Some(d) = parse_dynamic(name) else { return Some(None) };
+    Some(match d {
+        Dynamic::Uuid => {
             let (a, b) = (random_u64(), random_u64());
             Some(format!(
                 "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
@@ -132,10 +187,9 @@ fn dynamic(name: &str) -> Option<Option<String>> {
                 b & 0xffff_ffff_ffff
             ))
         }
-        "$timestamp" => Some(now.as_secs().to_string()),
-        "$randomInt" => Some((random_u64() % 1000).to_string()),
-        "$env" | "$processEnv" => std::env::var(arg).ok(),
-        _ => None,
+        Dynamic::Timestamp => Some(now.as_secs().to_string()),
+        Dynamic::RandomInt => Some((random_u64() % 1000).to_string()),
+        Dynamic::Env(var) => std::env::var(var).ok(),
     })
 }
 
@@ -270,7 +324,8 @@ mod tests {
         let mut c = c;
         c.env.insert("baseUrl".into(), "https://env".into());
         assert_eq!(c.raw("baseUrl"), Some("https://env"));
-        assert!(c.is_defined("$uuid") && c.is_defined("a") && !c.is_defined("zzz"));
+        assert_eq!(c.missing("a"), None);
+        assert_eq!(c.missing("zzz"), Some(Missing::Var));
     }
 
     #[test]
@@ -313,6 +368,27 @@ mod tests {
         assert_eq!(c.substitute("{{$env.PATH}}").unwrap(), home);
         assert_eq!(c.substitute("{{$processEnv PATH}}").unwrap(), home);
         assert!(c.substitute("{{$bogus}}").is_err());
+    }
+
+    #[test]
+    fn random_uuid_alias() {
+        let v = Ctx::default().substitute("{{$random.uuid}}").unwrap();
+        assert_eq!(v.len(), 36);
+    }
+
+    #[test]
+    fn missing_reasons() {
+        let c = Ctx { env: map(&[("$custom", "x")]), ..Ctx::default() };
+        assert_eq!(c.missing("$uuid"), None);
+        assert_eq!(c.missing("$randomInt 1 10"), None);
+        assert_eq!(c.missing("$env.PATH"), None);
+        assert_eq!(c.missing("$nope"), Some(Missing::UnknownDynamic));
+        assert_eq!(c.missing("$env"), Some(Missing::UnknownDynamic));
+        assert_eq!(c.missing("$env.OPENAPI_LSP_TEST_SURELY_UNSET"), Some(Missing::EnvUnset("OPENAPI_LSP_TEST_SURELY_UNSET".into())));
+        // A `$` name never falls back to plain variables, matching `substitute`.
+        assert_eq!(c.missing("$custom"), Some(Missing::UnknownDynamic));
+        assert!(c.substitute("{{$custom}}").is_err());
+        assert_eq!(Missing::Var.message("x", "dev"), "Variable `x` is not defined in env `dev`");
     }
 
     #[test]

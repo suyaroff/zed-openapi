@@ -205,13 +205,13 @@ impl Expect {
     }
 }
 
-/// (expression, failure) for every `@expect`; unparsable ones fail with the parse error.
-pub fn run_all(exprs: &[String], o: &Observed) -> Vec<(String, Option<String>)> {
+/// (expression, failure) for every `@expect`; unparsable or unresolved ones fail with that error.
+pub fn run_all(exprs: &[Result<String, (String, String)>], o: &Observed) -> Vec<(String, Option<String>)> {
     exprs
         .iter()
-        .map(|e| {
-            let r = parse(e).and_then(|x| x.check(o));
-            (e.clone(), r.err())
+        .map(|e| match e {
+            Ok(e) => (e.clone(), parse(e).and_then(|x| x.check(o)).err()),
+            Err((raw, err)) => (raw.clone(), Some(err.clone())),
         })
         .collect()
 }
@@ -329,11 +329,17 @@ mod tests {
     #[test]
     fn run_all_keeps_order() {
         let o = obs(None, "", &[]);
-        let exprs = vec!["status 201".to_string(), "status 500".to_string(), "bogus ~".to_string()];
+        let exprs = vec![
+            Ok("status 201".to_string()),
+            Ok("status 500".to_string()),
+            Ok("bogus ~".to_string()),
+            Err(("status {{$nope}}".to_string(), "undefined variable(s): $nope".to_string())),
+        ];
         let r = run_all(&exprs, &o);
-        assert_eq!(r.len(), 3);
+        assert_eq!(r.len(), 4);
         assert_eq!(r[0], ("status 201".to_string(), None));
         assert_eq!(r[1].1.as_deref(), Some("got 201"));
         assert!(r[2].1.as_deref().unwrap().contains("unknown operator"));
+        assert_eq!(r[3], ("status {{$nope}}".to_string(), Some("undefined variable(s): $nope".to_string())));
     }
 }
