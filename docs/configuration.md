@@ -1,0 +1,45 @@
+# Настройки
+
+`.zed/settings.json`:
+
+```json
+{
+  "code_lens": "on",
+  "lsp": {
+    "openapi-lsp": {
+      "settings": {
+        "spec": "docs/API/openapi.json",
+        "env": "dev",
+        "vars": { "locale": "ru" },
+        "envs": {
+          "dev":  { "baseUrl": "http://reg.napp.local/api" },
+          "prod": { "baseUrl": "https://reg.napp.uz/api", "token": "{{$env.PROD_TOKEN}}" }
+        }
+      }
+    }
+  }
+}
+```
+
+| Ключ | По умолчанию | |
+|---|---|---|
+| `spec` | автопоиск `openapi.{json,yaml}` | путь от корня проекта; в файле можно переопределить через `# @spec ../path.json` |
+| `env` | `dev`, иначе первое окружение | окружение из `envs` |
+| `vars`, `envs` | — | переменные и окружения (см. ниже) |
+| `responsesDir` | `.openapi/responses` | куда сохранять ответы: путь от корня проекта (или абсолютный) |
+| `timeout` | `30` | секунды |
+| `defaultAccept` | `application/json` | добавляется, если нет `Accept`; `null` — не добавлять |
+| `focusResponse` | `false` | переводить фокус на ответ |
+| `insecure` | `false` | не проверять TLS-сертификат (по умолчанию используется системное хранилище, так что mkcert и подобные работают) |
+
+## Окружения и переменные
+
+`envs` — окружения, `vars` — переменные, общие для всех окружений. Порядок разрешения — в [Переменных](variables.md#порядок-разрешения).
+
+Если `baseUrl` не задан, берётся `servers[0].url` из спека.
+
+Переменная `token` включает автоматический `Authorization` — см. [Автоматические заголовки](sending.md#автоматические-заголовки).
+
+## Секреты
+
+Берите через `{{$env.X}}` или кладите в пользовательский `~/.config/zed/settings.json`, а не в `.zed/settings.json` проекта.

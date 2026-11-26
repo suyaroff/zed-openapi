@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Zed extension: `.http` request files (REST Client / JetBrains syntax) backed by an OpenAPI spec — hover docs, completion, diagnostics, and sending requests. User-facing docs and settings: `README.md`.
+Zed extension: `.http` request files (REST Client / JetBrains syntax) backed by an OpenAPI spec — hover docs, completion, diagnostics, and sending requests. User-facing docs: `docs/` (index in `docs/README.md`), one file per topic; `README.md` is only a landing page. Update the matching `docs/*.md` when behavior changes.
 
 ## Two separate crates
 
