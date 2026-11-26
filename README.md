@@ -4,7 +4,9 @@
 
 - **Hover**, **Completion**, **Diagnostics** по спеку — [подробнее](docs/editor.md).
 - **▶ Send** (code lens или code action): ответ сохраняется в `.openapi/responses/<name>.http` вместе с отправленным запросом — [подробнее](docs/sending.md).
-- **Preview request** (code action): итоговый запрос без отправки.
+- **Preview request** и **Show as curl** (code actions): итоговый запрос без отправки.
+- **Проверка ответа по спеку**: статус, `Content-Type`, типы, `enum`, обязательные поля — diagnostics в файле ответа.
+- **env: dev** (code lens): переключение окружения без правки настроек.
 
 ## Быстрый старт
 
