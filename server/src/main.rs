@@ -1,6 +1,8 @@
 mod completion;
+mod cookies;
 mod diagnostics;
 mod env;
+mod generate;
 mod http_parser;
 mod json_scan;
 mod render;
@@ -38,14 +40,153 @@ const CMD_OPEN: &str = "openapi.openResponse";
 const CMD_PREVIEW: &str = "openapi.preview";
 const CMD_CURL: &str = "openapi.curl";
 const CMD_ENV: &str = "openapi.selectEnv";
+const CMD_CLEAR_COOKIES: &str = "openapi.clearCookies";
 
-struct PreparedAt {
-    prepared: runner::Prepared,
-    opts: runner::RunOptions,
-    root: PathBuf,
-    env_name: String,
-    key: String,
+/// Everything needed to prepare and send one request, so it can be (re)prepared off the main
+/// thread, e.g. after `@auth` captured a fresh token.
+#[derive(Clone)]
+struct Job {
+    uri: Uri,
+    req: http_parser::Request,
+    ctx: Ctx,
     spec: Option<Arc<Spec>>,
+    spec_path: Option<PathBuf>,
+    base_dir: PathBuf,
+    root: PathBuf,
+    opts: runner::RunOptions,
+    cookies: bool,
+}
+
+impl Job {
+    fn key(&self) -> (Uri, String) {
+        (self.uri.clone(), self.req.key())
+    }
+
+    fn label(&self) -> String {
+        self.req.name.clone().unwrap_or_else(|| format!("{} {}", self.req.method, self.req.url))
+    }
+
+    fn jar(&self) -> Option<cookies::Jar> {
+        self.cookies.then(|| cookies::Jar::load(&self.root, &self.ctx.env_name))
+    }
+
+    fn prepare(&self, jar: Option<&cookies::Jar>) -> Result<runner::Prepared, String> {
+        let mut p = runner::prepare(&self.req, &self.ctx, self.spec.as_deref(), &self.base_dir, &self.opts)?;
+        p.spec_path = self.spec_path.clone();
+        if let Some(jar) = jar {
+            runner::apply_cookies(&mut p, jar);
+        }
+        Ok(p)
+    }
+
+    fn reload_captured(&mut self) {
+        self.ctx.captured = env::load_captured(&self.root, &self.ctx.env_name);
+    }
+
+    fn missing_captures(&self, login: &Job) -> bool {
+        login.req.captures.iter().any(|(var, _)| self.ctx.raw(var).is_none_or(str::is_empty))
+    }
+}
+
+/// Main-thread state the send thread needs: lenses, opening responses.
+#[derive(Clone)]
+struct Bg {
+    sender: Sender<Message>,
+    runs: Arc<Mutex<HashMap<(Uri, String), LastRun>>>,
+    pending: Arc<Mutex<HashMap<RequestId, PathBuf>>>,
+    next_id: Arc<AtomicU64>,
+    focus: bool,
+    responses_dir: String,
+}
+
+impl Bg {
+    fn set_lens(&self, key: (Uri, String), run: LastRun) {
+        self.runs.lock().unwrap().insert(key, run);
+        request::<CodeLensRefresh>(&self.sender, &self.next_id, ());
+    }
+
+    fn exec(&self, job: &Job, note: Option<&str>) -> Result<runner::Outcome, String> {
+        let mut jar = job.jar();
+        let prepared = job.prepare(jar.as_ref()).map_err(|e| format!("Request not sent: {e}"))?;
+        log(&self.sender, format!("{} {}", prepared.method, prepared.url));
+        let dir = job.root.join(&self.responses_dir);
+        let result = runner::run(&prepared, &job.opts, &dir, &job.root, &job.ctx.env_name, jar.as_mut());
+        if let Some(jar) = jar.filter(|j| j.changed) {
+            if let Err(e) = jar.save(&job.root, &job.ctx.env_name) {
+                log(&self.sender, format!("cannot save cookies: {e}"));
+            }
+        }
+        let o = match result {
+            Ok(o) => o,
+            Err(e) => {
+                let e = format!("{} {}: {e}", prepared.method, prepared.url);
+                self.set_lens(job.key(), LastRun { title: format!("✗ {}", util::one_line(&e, 60)), path: None });
+                return Err(e);
+            }
+        };
+        let mark = if o.status < 400 { "✓" } else { "✗" };
+        let mut title = format!("{mark} {} {} · {} ms", o.status, o.reason, o.elapsed.as_millis());
+        if let Some(n) = note {
+            title.push_str(&format!(" · {n}"));
+        }
+        if !o.captured.is_empty() {
+            let names: Vec<&str> = o.captured.iter().map(|(k, _)| k.as_str()).collect();
+            title.push_str(&format!(" · captured {}", names.join(", ")));
+        }
+        let issues = job
+            .spec
+            .as_deref()
+            .zip(std::fs::read_to_string(&o.response_path).ok())
+            .map_or(0, |(spec, text)| response::warning_count(&text, spec));
+        if issues > 0 {
+            title.push_str(&format!(" · ⚠ {issues} spec"));
+        }
+        let id = request::<ShowDocument>(
+            &self.sender,
+            &self.next_id,
+            ShowDocumentParams {
+                uri: path_to_uri(&o.response_path),
+                external: Some(false),
+                take_focus: Some(self.focus),
+                selection: None,
+            },
+        );
+        self.pending.lock().unwrap().insert(id, o.response_path.clone());
+        self.set_lens(job.key(), LastRun { title, path: Some(o.response_path.clone()) });
+        Ok(o)
+    }
+
+    fn login(&self, login: &Job) -> Result<(), String> {
+        let o = self.exec(login, None)?;
+        if !(200..300).contains(&o.status) {
+            return Err(format!("@auth `{}` failed: {} {}", login.label(), o.status, o.reason));
+        }
+        if o.captured.is_empty() && !login.req.captures.is_empty() {
+            return Err(format!("@auth `{}` captured nothing", login.label()));
+        }
+        Ok(())
+    }
+
+    /// `@auth`: log in first when the login's captures are empty, and once more on 401.
+    fn send(&self, mut job: Job, login: Option<Job>) -> Result<(), String> {
+        let name = login.as_ref().map(Job::label);
+        let mut relogged = false;
+        if let Some(login) = login.as_ref().filter(|l| job.missing_captures(l)) {
+            self.set_lens(job.key(), LastRun { title: format!("⏳ {}…", login.label()), path: None });
+            self.login(login)?;
+            job.reload_captured();
+            relogged = true;
+        }
+        let note = name.as_deref().filter(|_| relogged).map(|n| format!("↻ {n}"));
+        let o = self.exec(&job, note.as_deref())?;
+        if let (401, false, Some(login)) = (o.status, relogged, login.as_ref()) {
+            self.login(login)?;
+            job.reload_captured();
+            let note = format!("↻ {} after 401", login.label());
+            self.exec(&job, Some(&note))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -60,6 +201,7 @@ struct Settings {
     default_accept: Option<String>,
     focus_response: bool,
     insecure: bool,
+    cookie_jar: bool,
 }
 
 impl Default for Settings {
@@ -74,6 +216,7 @@ impl Default for Settings {
             default_accept: Some("application/json".into()),
             focus_response: false,
             insecure: false,
+            cookie_jar: true,
         }
     }
 }
@@ -136,9 +279,38 @@ fn show(sender: &Sender<Message>, typ: MessageType, msg: impl Into<String>) {
     notify::<ShowMessage>(sender, ShowMessageParams { typ, message: msg.into() });
 }
 
+const SKIP_DIRS: &[&str] = &["node_modules", "vendor", "target", "storage", "dist", "build", "bootstrap"];
+
+fn walkable(e: &std::fs::DirEntry) -> bool {
+    let n = e.file_name();
+    let n = n.to_string_lossy();
+    !n.starts_with('.') && !SKIP_DIRS.contains(&n.as_ref())
+}
+
+/// `.http` / `.rest` files under `root`, breadth-first, at most 6 levels deep.
+fn http_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut queue = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let path = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() && depth < 6 && walkable(&e) => queue.insert(0, (path, depth + 1)),
+                Ok(t) if t.is_file() && matches!(path.extension().and_then(|x| x.to_str()), Some("http" | "rest")) => {
+                    out.push(path)
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 fn discover_spec(root: &Path) -> Option<PathBuf> {
     const NAMES: &[&str] = &["openapi.json", "openapi.yaml", "openapi.yml", "swagger.json", "swagger.yaml"];
-    const SKIP: &[&str] = &["node_modules", "vendor", "target", "storage", "dist", "build", "bootstrap"];
     let mut queue = vec![(root.to_path_buf(), 0)];
     let mut i = 0;
     while i < queue.len() {
@@ -157,11 +329,7 @@ fn discover_spec(root: &Path) -> Option<PathBuf> {
         let mut subdirs: Vec<PathBuf> = rd
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter(|e| {
-                let n = e.file_name();
-                let n = n.to_string_lossy();
-                !n.starts_with('.') && !SKIP.contains(&n.as_ref())
-            })
+            .filter(walkable)
             .map(|e| e.path())
             .collect();
         subdirs.sort();
@@ -400,58 +568,78 @@ impl Server {
 
     fn code_actions(&mut self, p: CodeActionParams) -> Vec<CodeActionOrCommand> {
         let uri = p.text_document.uri;
-        let Some(text) = self.docs.get(&uri) else { return Vec::new() };
-        let file = http_parser::parse(text);
-        let Some(req) = file.request_at(p.range.start.line as usize) else { return Vec::new() };
-        let mut out = vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Send request: {} {}", req.method, req.url),
-            command: Some(Command {
-                title: "Send request".into(),
-                command: CMD_SEND.into(),
-                arguments: Some(vec![json!(uri.as_str()), json!(req.line)]),
-            }),
-            ..Default::default()
-        })];
-        for (title, cmd) in [("Preview request", CMD_PREVIEW), ("Show as curl", CMD_CURL)] {
-            out.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: title.into(),
-                command: Some(Command {
-                    title: title.into(),
-                    command: cmd.into(),
-                    arguments: Some(vec![json!(uri.as_str()), json!(req.line)]),
-                }),
-                ..Default::default()
-            }));
-        }
-        let current = self.env_name(&self.root_for(&uri));
-        for name in self.settings.envs.keys().filter(|n| **n != current) {
-            let title = format!("Switch env to {name}");
-            out.push(CodeActionOrCommand::CodeAction(CodeAction {
+        let Some((text, file, spec)) = self.load(&uri) else { return Vec::new() };
+        let line = p.range.start.line as usize;
+        let cmd = |title: String, command: &str, arguments: Vec<Value>| {
+            CodeActionOrCommand::CodeAction(CodeAction {
                 title: title.clone(),
-                command: Some(Command {
-                    title,
-                    command: CMD_ENV.into(),
-                    arguments: Some(vec![json!(uri.as_str()), json!(name)]),
-                }),
+                command: Some(Command { title, command: command.into(), arguments: Some(arguments) }),
                 ..Default::default()
-            }));
+            })
+        };
+        let mut out = Vec::new();
+        if let Some(req) = file.request_at(line) {
+            let at = vec![json!(uri.as_str()), json!(req.line)];
+            out.push(cmd(format!("Send request: {} {}", req.method, req.url), CMD_SEND, at.clone()));
+            out.push(cmd("Preview request".into(), CMD_PREVIEW, at.clone()));
+            out.push(cmd("Show as curl".into(), CMD_CURL, at));
+            let last = self.runs.lock().unwrap().get(&(uri.clone(), req.key())).and_then(|r| r.path.clone());
+            if let Some(path) = last {
+                out.push(cmd("Open last response".into(), CMD_OPEN, vec![json!(path.to_string_lossy())]));
+            }
         }
-        if let Some(path) = self
-            .runs
-            .lock()
-            .unwrap()
-            .get(&(uri.clone(), req.key()))
-            .and_then(|r| r.path.clone())
-        {
-            out.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: "Open last response".into(),
-                command: Some(Command {
-                    title: "Open last response".into(),
-                    command: CMD_OPEN.into(),
-                    arguments: Some(vec![json!(path.to_string_lossy())]),
+        let root = self.root_for(&uri);
+        let current = self.env_name(&root);
+        if !file.requests.is_empty() {
+            for name in self.settings.envs.keys().filter(|n| **n != current) {
+                out.push(cmd(format!("Switch env to {name}"), CMD_ENV, vec![json!(uri.as_str()), json!(name)]));
+            }
+            let jar = cookies::Jar::load(&root, &current);
+            if jar.len() > 0 {
+                let title = format!("Clear cookies ({}, env {current})", jar.len());
+                out.push(cmd(title, CMD_CLEAR_COOKIES, vec![json!(uri.as_str())]));
+            }
+        }
+        let blank = text.lines().nth(line).is_none_or(|l| l.trim().is_empty());
+        if let Some(spec) = spec.as_deref().filter(|_| file.requests.is_empty() || blank) {
+            out.extend(self.generate_actions(&uri, &text, &file, spec));
+        }
+        out
+    }
+
+    fn generate_actions(&self, uri: &Uri, text: &str, file: &HttpFile, spec: &Spec) -> Vec<CodeActionOrCommand> {
+        let groups = generate::missing_by_tag(spec, file);
+        let lines = split_lines(text);
+        let last = lines.len().saturating_sub(1);
+        let end = util::range_on_line(&lines, last, lines[last].len(), lines[last].len()).end;
+        let sep = if text.trim().is_empty() || text.ends_with("\n\n") {
+            ""
+        } else if text.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let action = |title: String, ops: &[&spec::Op]| {
+            let new_text = format!("{sep}{}\n", generate::blocks(spec, ops, file));
+            let edit = TextEdit { range: Range::new(end, end), new_text };
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::SOURCE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+                    ..Default::default()
                 }),
                 ..Default::default()
-            }));
+            })
+        };
+        let plural = |n: usize| if n == 1 { "request" } else { "requests" };
+        let mut out: Vec<CodeActionOrCommand> = groups
+            .iter()
+            .map(|(tag, ops)| action(format!("Generate {} {} for tag `{tag}`", ops.len(), plural(ops.len())), ops))
+            .collect();
+        if groups.len() > 1 {
+            let all: Vec<&spec::Op> = groups.iter().flat_map(|(_, ops)| ops.iter().copied()).collect();
+            out.push(action(format!("Generate all {} missing {}", all.len(), plural(all.len())), &all));
         }
         out
     }
@@ -488,6 +676,16 @@ impl Server {
                     }
                 }
             }
+            CMD_CLEAR_COOKIES => {
+                if let Some(uri) = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok()) {
+                    let root = self.root_for(&uri);
+                    let env = self.env_name(&root);
+                    match cookies::Jar::clear(&root, &env) {
+                        Ok(()) => show(&self.sender, MessageType::INFO, format!("Cookies cleared for env `{env}`")),
+                        Err(e) => show(&self.sender, MessageType::ERROR, format!("Cannot clear cookies: {e}")),
+                    }
+                }
+            }
             CMD_ENV => {
                 let Some(uri) = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok())
                 else {
@@ -503,47 +701,89 @@ impl Server {
         }
     }
 
-    fn prepare_at(&mut self, uri: &Uri, line: usize) -> Option<PreparedAt> {
-        let (_, file, spec) = self.load(uri)?;
-        let req = file.requests.iter().find(|r| r.line == line).or_else(|| file.request_at(line))?;
-        let ctx = self.ctx_for(uri, &file, spec.as_deref());
+    fn job(&mut self, uri: &Uri, file: &HttpFile, req: &http_parser::Request, spec: Option<Arc<Spec>>) -> Job {
+        let ctx = self.ctx_for(uri, file, spec.as_deref());
         let root = self.root_for(uri);
         let base_dir = uri_to_path(uri)
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| root.clone());
         let opts = runner::RunOptions {
-            timeout: Duration::from_secs(self.settings.timeout.max(1)),
+            timeout: req.opts.timeout.unwrap_or(Duration::from_secs(self.settings.timeout.max(1))),
             default_accept: self.settings.default_accept.clone(),
-            insecure: self.settings.insecure,
+            insecure: self.settings.insecure || req.opts.insecure,
+            follow_redirects: !req.opts.no_redirect,
         };
-        let key = req.key();
-        match runner::prepare(req, &ctx, spec.as_deref(), &base_dir, &opts) {
-            Ok(mut prepared) => {
-                if spec.is_some() {
-                    prepared.spec_path = self.spec_path(uri, &file);
-                }
-                Some(PreparedAt { prepared, opts, root, env_name: ctx.env_name, key, spec })
-            }
-            Err(e) => {
-                show(&self.sender, MessageType::ERROR, format!("Request not sent: {e}"));
-                None
-            }
+        let spec_path = spec.is_some().then(|| self.spec_path(uri, file)).flatten();
+        Job {
+            uri: uri.clone(),
+            req: req.clone(),
+            ctx,
+            spec,
+            spec_path,
+            base_dir,
+            root,
+            opts,
+            cookies: self.settings.cookie_jar && !req.opts.no_cookie_jar,
         }
     }
 
+    fn job_at(&mut self, uri: &Uri, line: usize) -> Option<(Job, HttpFile)> {
+        let (_, file, spec) = self.load(uri)?;
+        let req = file.requests.iter().find(|r| r.line == line).or_else(|| file.request_at(line))?.clone();
+        Some((self.job(uri, &file, &req, spec), file))
+    }
+
+    /// `@auth` target: this file, then other open documents, then `.http` files in the project.
+    fn find_named(&mut self, uri: &Uri, file: &HttpFile, name: &str) -> Option<Job> {
+        if let Some(r) = file.named(name).cloned() {
+            let spec = self.spec_for(uri, file);
+            return Some(self.job(uri, file, &r, spec));
+        }
+        let mut candidates: Vec<(Uri, String)> = self
+            .docs
+            .iter()
+            .filter(|(u, _)| *u != uri)
+            .map(|(u, t)| (u.clone(), t.clone()))
+            .collect();
+        let responses = self.root_for(uri).join(&self.settings.responses_dir);
+        for path in http_files(&self.root_for(uri)) {
+            let u = path_to_uri(&path);
+            if path.starts_with(&responses) || u == *uri || candidates.iter().any(|(c, _)| *c == u) {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(&path) {
+                candidates.push((u, t));
+            }
+        }
+        for (u, text) in candidates {
+            let other = http_parser::parse(&text);
+            if let Some(r) = other.named(name).cloned() {
+                let spec = self.spec_for(&u, &other);
+                return Some(self.job(&u, &other, &r, spec));
+            }
+        }
+        None
+    }
+
     fn preview(&mut self, uri: Uri, line: usize) {
-        let Some(p) = self.prepare_at(&uri, line) else { return };
-        let dir = p.root.join(&self.settings.responses_dir);
-        match runner::write_preview(&p.prepared, &dir, &p.env_name) {
+        let Some((job, _)) = self.job_at(&uri, line) else { return };
+        let dir = job.root.join(&self.settings.responses_dir);
+        let result = job
+            .prepare(job.jar().as_ref())
+            .and_then(|p| runner::write_preview(&p, &dir, &job.ctx.env_name));
+        match result {
             Ok(path) => self.open_document(&path, true),
             Err(e) => show(&self.sender, MessageType::ERROR, format!("Preview failed: {e}")),
         }
     }
 
     fn curl(&mut self, uri: Uri, line: usize) {
-        let Some(p) = self.prepare_at(&uri, line) else { return };
-        let dir = p.root.join(&self.settings.responses_dir);
-        match runner::write_curl(&p.prepared, &p.opts, &dir) {
+        let Some((job, _)) = self.job_at(&uri, line) else { return };
+        let dir = job.root.join(&self.settings.responses_dir);
+        let result = job
+            .prepare(job.jar().as_ref())
+            .and_then(|p| runner::write_curl(&p, &job.opts, &dir));
+        match result {
             Ok(path) => self.open_document(&path, true),
             Err(e) => show(&self.sender, MessageType::ERROR, format!("curl export failed: {e}")),
         }
@@ -595,57 +835,39 @@ impl Server {
     }
 
     fn send(&mut self, uri: Uri, line: usize) {
-        let Some(PreparedAt { prepared, opts, root, env_name, key, spec }) = self.prepare_at(&uri, line) else {
-            return;
+        let Some((job, file)) = self.job_at(&uri, line) else { return };
+        let login = match file.auth_for(&job.req) {
+            Some(name) => match self.find_named(&uri, &file, name) {
+                Some(l) => Some(l),
+                None => {
+                    show(&self.sender, MessageType::ERROR, format!("@auth: no request named `{name}`"));
+                    return;
+                }
+            },
+            None => None,
         };
-        let key = (uri, key);
-
-        self.runs.lock().unwrap().insert(key.clone(), LastRun { title: "⏳ sending…".into(), path: None });
-        request::<CodeLensRefresh>(&self.sender, &self.next_id, ());
-
-        let responses_dir = root.join(&self.settings.responses_dir);
-        let sender = self.sender.clone();
-        let runs = self.runs.clone();
-        let pending = self.pending_show.clone();
-        let next_id = self.next_id.clone();
-        let focus = self.settings.focus_response;
+        // Without @auth nothing can fill missing variables later, so fail right away.
+        if login.as_ref().is_none_or(|l| !job.missing_captures(l)) {
+            if let Err(e) = job.prepare(None) {
+                show(&self.sender, MessageType::ERROR, format!("Request not sent: {e}"));
+                return;
+            }
+        }
+        let bg = Bg {
+            sender: self.sender.clone(),
+            runs: self.runs.clone(),
+            pending: self.pending_show.clone(),
+            next_id: self.next_id.clone(),
+            focus: self.settings.focus_response,
+            responses_dir: self.settings.responses_dir.clone(),
+        };
+        bg.set_lens(job.key(), LastRun { title: "⏳ sending…".into(), path: None });
         std::thread::spawn(move || {
-            log(&sender, format!("{} {}", prepared.method, prepared.url));
-            let run = match runner::run(&prepared, &opts, &responses_dir, &root, &env_name) {
-                Ok(o) => {
-                    let mark = if o.status < 400 { "✓" } else { "✗" };
-                    let mut title = format!("{mark} {} {} · {} ms", o.status, o.reason, o.elapsed.as_millis());
-                    if !o.captured.is_empty() {
-                        let names: Vec<&str> = o.captured.iter().map(|(k, _)| k.as_str()).collect();
-                        title.push_str(&format!(" · captured {}", names.join(", ")));
-                    }
-                    let issues = spec.as_deref().zip(std::fs::read_to_string(&o.response_path).ok()).map_or(
-                        0,
-                        |(spec, text)| response::warning_count(&text, spec),
-                    );
-                    if issues > 0 {
-                        title.push_str(&format!(" · ⚠ {issues} spec"));
-                    }
-                    let id = request::<ShowDocument>(
-                        &sender,
-                        &next_id,
-                        ShowDocumentParams {
-                            uri: path_to_uri(&o.response_path),
-                            external: Some(false),
-                            take_focus: Some(focus),
-                            selection: None,
-                        },
-                    );
-                    pending.lock().unwrap().insert(id, o.response_path.clone());
-                    LastRun { title, path: Some(o.response_path) }
-                }
-                Err(e) => {
-                    show(&sender, MessageType::ERROR, format!("{} {}: {e}", prepared.method, prepared.url));
-                    LastRun { title: format!("✗ {}", util::one_line(&e, 60)), path: None }
-                }
-            };
-            runs.lock().unwrap().insert(key, run);
-            request::<CodeLensRefresh>(&sender, &next_id, ());
+            let key = job.key();
+            if let Err(e) = bg.send(job, login) {
+                show(&bg.sender, MessageType::ERROR, &e);
+                bg.set_lens(key, LastRun { title: format!("✗ {}", util::one_line(&e, 60)), path: None });
+            }
         });
     }
 
@@ -821,13 +1043,13 @@ fn main() -> anyhow::Result<()> {
         })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(["/", "{", "\"", "?", "&", ":"].map(String::from).to_vec()),
+            trigger_characters: Some(["/", "{", "\"", "?", "&", ":", "@"].map(String::from).to_vec()),
             ..Default::default()
         }),
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV].map(String::from).to_vec(),
+            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV, CMD_CLEAR_COOKIES].map(String::from).to_vec(),
             ..Default::default()
         }),
         ..Default::default()

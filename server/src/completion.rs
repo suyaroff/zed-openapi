@@ -1,5 +1,5 @@
 use crate::env::Ctx;
-use crate::http_parser::{HttpFile, Request, METHODS};
+use crate::http_parser::{HttpFile, Request, DIRECTIVES, METHODS};
 use crate::json_scan;
 use crate::render;
 use crate::spec::{Op, Spec};
@@ -135,6 +135,9 @@ pub fn complete(
             v
         }
         _ => {
+            if let Some(items) = directives(&cx, file, before) {
+                return items;
+            }
             let t = before.trim_start();
             if t.starts_with('#') || t.starts_with("//") || t.starts_with('@') {
                 return Vec::new();
@@ -142,6 +145,44 @@ pub fn complete(
             operations(&cx, spec, true, before)
         }
     }
+}
+
+/// `# @dir…` names, and request names after `# @auth `.
+fn directives(cx: &Cx, file: &HttpFile, before: &str) -> Option<Vec<CompletionItem>> {
+    let t = before.trim_start();
+    let word = t.strip_prefix('#').or_else(|| t.strip_prefix("//"))?.trim_start().strip_prefix('@')?;
+    if let Some(arg) = word.strip_prefix("auth ") {
+        let arg = arg.trim_start();
+        let start = before.len() - arg.len();
+        let items = file
+            .requests
+            .iter()
+            .filter_map(|r| r.name.as_ref().map(|n| (n, r)))
+            .map(|(n, r)| CompletionItem {
+                label: n.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some(format!("{} {}", r.method, r.url)),
+                text_edit: cx.edit(start, cx.col, n.clone()),
+                ..Default::default()
+            })
+            .collect();
+        return Some(items);
+    }
+    if word.contains(char::is_whitespace) {
+        return None;
+    }
+    let start = before.len() - word.len();
+    let items = DIRECTIVES
+        .iter()
+        .map(|(name, doc)| CompletionItem {
+            label: (*name).into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some((*doc).into()),
+            text_edit: cx.edit(start, cx.col, (*name).into()),
+            ..Default::default()
+        })
+        .collect();
+    Some(items)
 }
 
 fn variables(cx: &Cx, start: usize, ctx: &Ctx, text: &str) -> Vec<CompletionItem> {
@@ -179,16 +220,34 @@ fn op_summary(spec: &Spec, op: &Op) -> String {
 
 /// Snippet for a full request; `{param}` path segments become placeholders.
 pub fn request_snippet(spec: &Spec, op: &Op, full: bool) -> String {
+    request_template(spec, op, full, true)
+}
+
+/// Plain-text request for generated files: `{param}` becomes `{{param}}`, values are left empty.
+pub fn request_text(spec: &Spec, op: &Op) -> String {
+    request_template(spec, op, true, false)
+}
+
+fn request_template(spec: &Spec, op: &Op, full: bool, snippet: bool) -> String {
     let mut n = 1;
+    let esc = |s: &str| if snippet { snippet_escape(s) } else { s.to_string() };
+    // `${n:default}` in snippets, `default` in plain text.
+    let mut hole = |default: &str| {
+        let s = match (snippet, default.is_empty()) {
+            (false, _) => default.to_string(),
+            (true, true) => format!("${{{n}}}"),
+            (true, false) => format!("${{{n}:{default}}}"),
+        };
+        n += 1;
+        s
+    };
     let mut path = String::new();
     for seg in op.path.split('/').filter(|s| !s.is_empty()) {
         path.push('/');
         match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            Some(p) => {
-                path.push_str(&format!("${{{n}:{p}}}"));
-                n += 1;
-            }
-            None => path.push_str(&snippet_escape(seg)),
+            Some(p) if snippet => path.push_str(&hole(p)),
+            Some(p) => path.push_str(&format!("{{{{{p}}}}}")),
+            None => path.push_str(&esc(seg)),
         }
     }
     let params = spec.params(op);
@@ -199,9 +258,7 @@ pub fn request_snippet(spec: &Spec, op: &Op, full: bool) -> String {
         .filter(required)
         .map(|p| {
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
-            let s = format!("{}=${{{n}}}", snippet_escape(name));
-            n += 1;
-            s
+            format!("{}={}", esc(name), hole(""))
         })
         .collect();
     let mut out = format!("{} {{{{baseUrl}}}}{path}", op.method);
@@ -219,8 +276,7 @@ pub fn request_snippet(spec: &Spec, op: &Op, full: bool) -> String {
         .filter(required)
     {
         let name = p.get("name").and_then(Value::as_str).unwrap_or("");
-        out.push_str(&format!("{}: ${{{n}}}\n", snippet_escape(name)));
-        n += 1;
+        out.push_str(&format!("{}: {}\n", esc(name), hole("")));
     }
     if let Some((media, m)) = spec.body_media(op) {
         let schema = m.get("schema").cloned().unwrap_or(Value::Null);
@@ -234,34 +290,37 @@ pub fn request_snippet(spec: &Spec, op: &Op, full: bool) -> String {
                 out.push_str("--boundary\n");
                 if is_file {
                     out.push_str(&format!(
-                        "Content-Disposition: form-data; name=\"{0}\"; filename=\"file\"\n\n< ./${{{n}:file}}\n",
-                        snippet_escape(name)
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"file\"\n\n< ./{}\n",
+                        esc(name),
+                        hole("file")
                     ));
                 } else {
                     out.push_str(&format!(
-                        "Content-Disposition: form-data; name=\"{}\"\n\n${{{n}}}\n",
-                        snippet_escape(name)
+                        "Content-Disposition: form-data; name=\"{}\"\n\n{}\n",
+                        esc(name),
+                        hole("")
                     ));
                 }
-                n += 1;
             }
             out.push_str("--boundary--");
         } else if media.contains("x-www-form-urlencoded") {
             out.push_str(&format!("Content-Type: {media}\n\n"));
             let view = spec.object_view(&schema);
-            let fields: Vec<String> = view.props.iter().map(|(k, _)| format!("{}=", snippet_escape(k))).collect();
+            let fields: Vec<String> = view.props.iter().map(|(k, _)| format!("{}=", esc(k))).collect();
             out.push_str(&fields.join("&"));
         } else {
             out.push_str(&format!("Content-Type: {media}\n\n"));
             let value = Spec::media_example(m)
                 .cloned()
                 .unwrap_or_else(|| spec.skeleton(&schema, 0, false));
-            out.push_str(&snippet_escape(&serde_json::to_string_pretty(&value).unwrap_or_default()));
+            out.push_str(&esc(&serde_json::to_string_pretty(&value).unwrap_or_default()));
         }
     } else if out.ends_with('\n') {
         out.pop();
     }
-    out.push_str("$0");
+    if snippet {
+        out.push_str("$0");
+    }
     out
 }
 

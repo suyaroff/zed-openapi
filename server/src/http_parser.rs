@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub const METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
 ];
@@ -13,6 +15,42 @@ pub struct Header {
 pub struct Body {
     pub text: String,
     pub start_line: usize,
+}
+
+/// Per-request `# @…` directives (JetBrains-compatible names where they exist).
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub timeout: Option<Duration>,
+    pub no_redirect: bool,
+    pub insecure: bool,
+    pub no_auth: bool,
+    pub no_cookie_jar: bool,
+    /// `# @auth login`: name of the request that refreshes the token.
+    pub auth: Option<String>,
+}
+
+pub const DIRECTIVES: &[(&str, &str)] = &[
+    ("name", "request name: response file name and `@auth` target"),
+    ("capture", "`var = json.path`: save a response field after a 2xx response"),
+    ("spec", "OpenAPI spec for this file"),
+    ("auth", "request that logs in: run first if its captures are empty, and again on 401"),
+    ("no-auth", "don't add `Authorization` and don't run `@auth`"),
+    ("timeout", "timeout for this request: `120`, `500ms`, `2m`"),
+    ("no-redirect", "don't follow redirects"),
+    ("insecure", "don't verify the TLS certificate"),
+    ("no-cookie-jar", "don't send or store cookies"),
+];
+
+fn parse_duration(v: &str) -> Option<Duration> {
+    let v = v.trim();
+    let split = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let n: u64 = v[..split].parse().ok()?;
+    match v[split..].trim() {
+        "" | "s" => Some(Duration::from_secs(n)),
+        "ms" => Some(Duration::from_millis(n)),
+        "m" => Some(Duration::from_secs(n * 60)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +69,7 @@ pub struct Request {
     /// First line after the header block (the blank separator), if any.
     pub headers_end: usize,
     pub body: Option<Body>,
+    pub opts: Options,
 }
 
 impl Request {
@@ -64,11 +103,26 @@ pub struct HttpFile {
     pub vars: Vec<Var>,
     pub requests: Vec<Request>,
     pub spec: Option<String>,
+    /// `# @auth` in a block without a request: default for every request in the file.
+    pub auth: Option<String>,
 }
 
 impl HttpFile {
     pub fn request_at(&self, line: usize) -> Option<&Request> {
         self.requests.iter().find(|r| r.contains_line(line))
+    }
+
+    /// The `@auth` request for `req`, unless disabled or `req` is that request itself.
+    pub fn auth_for<'a>(&'a self, req: &'a Request) -> Option<&'a str> {
+        if req.opts.no_auth {
+            return None;
+        }
+        let name = req.opts.auth.as_deref().or(self.auth.as_deref())?;
+        (req.name.as_deref() != Some(name)).then_some(name)
+    }
+
+    pub fn named(&self, name: &str) -> Option<&Request> {
+        self.requests.iter().find(|r| r.name.as_deref() == Some(name))
     }
 }
 
@@ -145,6 +199,7 @@ pub fn parse(text: &str) -> HttpFile {
 fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) -> Option<Request> {
     let mut name = None;
     let mut captures = Vec::new();
+    let mut opts = Options::default();
     let mut i = start;
 
     if lines.get(start).is_some_and(|l| l.trim_start().starts_with("###")) {
@@ -153,6 +208,9 @@ fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) ->
 
     let req_line = loop {
         if i > end || i >= lines.len() {
+            if let Some(auth) = opts.auth {
+                file.auth.get_or_insert(auth);
+            }
             return None;
         }
         let trimmed = lines[i].trim();
@@ -171,6 +229,12 @@ fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) ->
                         }
                     }
                     "spec" if !val.is_empty() => file.spec = Some(val.to_string()),
+                    "auth" if !val.is_empty() => opts.auth = Some(val.to_string()),
+                    "timeout" => opts.timeout = parse_duration(val),
+                    "no-redirect" => opts.no_redirect = true,
+                    "insecure" => opts.insecure = true,
+                    "no-auth" => opts.no_auth = true,
+                    "no-cookie-jar" => opts.no_cookie_jar = true,
                     _ => {}
                 }
             }
@@ -262,5 +326,6 @@ fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) ->
         headers,
         headers_end,
         body,
+        opts,
     })
 }

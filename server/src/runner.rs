@@ -1,3 +1,4 @@
+use crate::cookies::Jar;
 use crate::env::{self, Ctx};
 use crate::http_parser::Request;
 use crate::spec::Spec;
@@ -6,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct Prepared {
     pub method: String,
     pub url: String,
@@ -14,6 +16,8 @@ pub struct Prepared {
     pub captures: Vec<(String, String)>,
     pub stem: String,
     pub spec_path: Option<PathBuf>,
+    /// The jar owns the `Cookie` header (the request didn't set one): recomputed on every hop.
+    pub jar_cookie: bool,
 }
 
 pub struct Outcome {
@@ -24,10 +28,12 @@ pub struct Outcome {
     pub captured: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 pub struct RunOptions {
     pub timeout: Duration,
     pub default_accept: Option<String>,
     pub insecure: bool,
+    pub follow_redirects: bool,
 }
 
 fn stem_for(req: &Request) -> String {
@@ -106,7 +112,7 @@ pub fn prepare(
     let has = |hs: &[(String, String)], n: &str| hs.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
 
     let op = spec.and_then(|s| s.find_exact(&req.method, &req.url).map(|op| (s, op)));
-    if !has(&headers, "authorization") {
+    if !req.opts.no_auth && !has(&headers, "authorization") {
         let wants_auth = op.is_none_or(|(s, op)| s.needs_bearer(op));
         if let Some(token) = ctx.raw("token").filter(|t| !t.is_empty() && wants_auth) {
             let token = ctx.substitute(token).map_err(undefined)?;
@@ -145,6 +151,7 @@ pub fn prepare(
         captures: req.captures.clone(),
         stem: stem_for(req),
         spec_path: None,
+        jar_cookie: false,
     })
 }
 
@@ -233,7 +240,7 @@ fn resolve_location(base: &str, location: &str) -> String {
 
 /// Follows redirects manually: unlike ureq/curl defaults, a same-host redirect
 /// (typically nginx http -> https) keeps the method, body and Authorization.
-fn execute(p: &Prepared, opts: &RunOptions) -> Result<RawResponse, String> {
+fn execute(p: &Prepared, opts: &RunOptions, mut jar: Option<&mut Jar>) -> Result<RawResponse, String> {
     let agent = agent(opts);
     let mut method = p.method.clone();
     let mut url = p.url.clone();
@@ -241,14 +248,34 @@ fn execute(p: &Prepared, opts: &RunOptions) -> Result<RawResponse, String> {
     let mut body = p.body.clone();
     let mut redirects = Vec::new();
     let mut resp = loop {
-        let resp = send_once(&agent, &method, &url, &headers, body.as_deref())?;
+        if let Some(jar) = jar.as_deref().filter(|_| p.jar_cookie) {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+            if let Some(c) = jar.header_for(&url) {
+                headers.push(("Cookie".into(), c));
+            }
+        }
+        let resp = send_once(&agent, &method, &url, &headers, body.as_deref()).map_err(|e| {
+            if e.starts_with("timeout") {
+                format!("timeout after {} ms", opts.timeout.as_millis())
+            } else {
+                e
+            }
+        })?;
+        if let Some(jar) = jar.as_deref_mut() {
+            for v in resp.headers().get_all("set-cookie") {
+                if let Ok(v) = v.to_str() {
+                    jar.store(&url, v);
+                }
+            }
+        }
         let status = resp.status().as_u16();
         let location = resp
             .headers()
             .get("location")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let Some(location) = location.filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308)) else {
+        let redirect = opts.follow_redirects && matches!(status, 301 | 302 | 303 | 307 | 308);
+        let Some(location) = location.filter(|_| redirect) else {
             break resp;
         };
         if redirects.len() >= 10 {
@@ -337,9 +364,10 @@ pub fn run(
     responses_dir: &Path,
     root: &Path,
     env_name: &str,
+    jar: Option<&mut Jar>,
 ) -> Result<Outcome, String> {
     let started = Instant::now();
-    let resp = execute(p, opts)?;
+    let resp = execute(p, opts, jar)?;
     let elapsed = started.elapsed();
 
     ensure_responses_dir(responses_dir)?;
@@ -485,6 +513,17 @@ pub fn write_preview(p: &Prepared, responses_dir: &Path, env_name: &str) -> Resu
     Ok(path)
 }
 
+/// Lets the jar own the `Cookie` header unless the request sets one itself.
+pub fn apply_cookies(p: &mut Prepared, jar: &Jar) {
+    if p.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+        return;
+    }
+    p.jar_cookie = true;
+    if let Some(c) = jar.header_for(&p.url) {
+        p.headers.push(("Cookie".into(), c));
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -495,10 +534,12 @@ pub fn write_curl(p: &Prepared, opts: &RunOptions, responses_dir: &Path) -> Resu
     if opts.insecure {
         args.push("-k".into());
     }
-    // Same-host redirects keep POST and its body, as in `execute`.
-    args.push("-L".into());
-    if p.method == "POST" {
-        args.extend(["--post301".into(), "--post302".into()]);
+    if opts.follow_redirects {
+        // Same-host redirects keep POST and its body, as in `execute`.
+        args.push("-L".into());
+        if p.method == "POST" {
+            args.extend(["--post301".into(), "--post302".into()]);
+        }
     }
     match p.method.as_str() {
         "HEAD" => args.push("-I".into()),

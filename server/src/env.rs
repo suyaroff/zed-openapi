@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const STATE_FILE: &str = ".openapi/state.json";
 const SELECTED_ENV_FILE: &str = ".openapi/env";
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Ctx {
     pub env_name: String,
     pub file_vars: HashMap<String, String>,
