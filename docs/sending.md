@@ -10,6 +10,8 @@ Code actions на запросе:
 | **Preview request** | собрать запрос без отправки — см. [Preview request](#preview-request) |
 | **Show as curl** | открыть запрос как curl-команду — см. [curl](#curl) |
 | **Open last response** | открыть последний ответ |
+| **Diff with previous response** | diff двух последних ответов — см. [История](#история-ответов) |
+| **Run all N requests** | отправить все запросы файла — см. [Run all](testing.md#run-all) |
 | **Switch env to …** | сменить окружение — см. [настройки](configuration.md#переключение-окружения) |
 
 ## Автоматические заголовки
@@ -142,3 +144,11 @@ Cookies из `Set-Cookie` сохраняются в `.openapi/cookies.json` от
 - Свой заголовок `Cookie` в запросе отключает хранилище для этого запроса (ответные cookies всё равно сохраняются).
 - `# @no-cookie-jar` — не отправлять и не сохранять cookies для запроса; `"cookieJar": false` в настройках — для всех.
 - Code action **Clear cookies (N, env dev)** очищает хранилище текущего окружения.
+
+## История ответов
+
+Каждый ответ, кроме основного `<responsesDir>/<name>.http`, сохраняется в `<responsesDir>/history/<name>/<дата-время>.http`; хранятся последние `historySize` (по умолчанию 10, `0` — не хранить).
+
+Code action **Diff with previous response** (когда есть хотя бы два ответа) открывает `<name>.diff` — unified diff двух последних. Сравнивается файл целиком, так что в diff попадают и время ответа, и заголовки вроде `Date`.
+
+Если у двух запросов одинаковые метод и путь (например, отличаются только query), они пишут в один файл и одну историю — задайте им разные `# @name`.

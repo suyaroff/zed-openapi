@@ -271,3 +271,29 @@ GET /redirect-to?url=/anything&status_code=302
 ## Сгенерировать запросы из спека
 
 Создайте пустой `users.http`, поставьте курсор в файл и выберите code action **Generate N requests for tag `users`** — в файл добавятся все операции тега с телами из схемы.
+
+## Smoke-тест файла
+
+```http
+### Login
+# @name login
+# @capture token = json.token
+# @expect status 200
+# @expect json.token exists
+POST /anything
+Content-Type: application/json
+
+{ "token": "secret-123" }
+
+### Bearer
+# @expect status 200
+# @expect authenticated == true
+# @expect token == secret-123
+GET /bearer
+
+### Медленный
+# @expect time < 3000
+GET /delay/1
+```
+
+**▶ Run all (3)** над первым запросом прогонит файл и покажет `▶ Run all (3) · ✓ 3 · 2.1 s`. Подробнее — [Проверки и Run all](testing.md).

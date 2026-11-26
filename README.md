@@ -9,6 +9,8 @@
 - **env: dev** (code lens): переключение окружения без правки настроек.
 - **`# @auth login`**: автологин — токен получается сам, если его нет или пришёл 401.
 - **Cookies** между запросами, отдельно для каждого окружения.
+- **`# @expect` и ▶ Run all**: проверки ответа и прогон всего файла — smoke-тест API.
+- **История ответов** и diff с предыдущим; **go to definition** по `{{var}}`.
 - **Генерация запросов** из спека по тегам; директивы `@timeout`, `@no-redirect`, `@insecure`, `@no-auth`, `@no-cookie-jar`.
 
 ## Быстрый старт
@@ -45,6 +47,7 @@ GET {{baseUrl}}/v1/profile
 - [Формат `.http`](docs/http-syntax.md)
 - [Переменные](docs/variables.md)
 - [Отправка запросов](docs/sending.md)
+- [Проверки и Run all](docs/testing.md)
 - [Возможности редактора](docs/editor.md)
 - [Примеры](docs/examples.md)
 - [Разработка](docs/development.md)
