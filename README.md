@@ -2,7 +2,7 @@
 
 Запросы в `.http`-файлах (синтаксис REST Client / JetBrains) с подсказками и документацией из OpenAPI-спека.
 
-- **Hover**, **Completion**, **Diagnostics** по спеку — [подробнее](docs/editor.md).
+- **Hover**, **Completion**, **Diagnostics** с quick fixes по спеку — [подробнее](docs/editor.md).
 - **▶ Send** (code lens или code action): ответ сохраняется в `.openapi/responses/<name>.http` вместе с отправленным запросом — [подробнее](docs/sending.md).
 - **Preview request** и **Show as curl** (code actions): итоговый запрос без отправки.
 - **Проверка ответа по спеку**: статус, `Content-Type`, типы, `enum`, обязательные поля — diagnostics в файле ответа.

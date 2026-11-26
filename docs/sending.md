@@ -11,6 +11,8 @@ Code actions на запросе:
 | **Show as curl** | открыть запрос как curl-команду — см. [curl](#curl) |
 | **Open last response** | открыть последний ответ |
 | **Diff with previous response** | diff двух последних ответов — см. [История](#история-ответов) |
+| **Format JSON body** | отформатировать JSON-тело; `{{vars}}` без кавычек остаются как есть |
+| **Open GET /users/{id} in spec** | открыть спек на этой операции |
 | **Run all N requests** | отправить все запросы файла — см. [Run all](testing.md#run-all) |
 | **Switch env to …** | сменить окружение — см. [настройки](configuration.md#переключение-окружения) |
 

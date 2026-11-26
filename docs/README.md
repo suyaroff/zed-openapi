@@ -6,6 +6,6 @@
 - [Переменные](variables.md) — `@var`, порядок разрешения, динамические, `@name` / `@capture`
 - [Отправка запросов](sending.md) — автоматические заголовки, редиректы, ответы, отправленный запрос, Preview, curl, проверка ответа по спеку, `@auth`, cookies, история и diff
 - [Проверки и Run all](testing.md) — `@expect`, прогон всего файла, smoke-тесты
-- [Возможности редактора](editor.md) — hover, completion, diagnostics, go to definition, генерация запросов
+- [Возможности редактора](editor.md) — hover, completion, diagnostics и quick fixes, go to definition, генерация запросов
 - [Примеры](examples.md) — готовые сценарии на httpbin.org: логин → токен, окружения, multipart, редиректы
 - [Разработка](development.md) — структура репозитория, сборка
