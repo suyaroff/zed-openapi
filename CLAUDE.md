@@ -14,7 +14,8 @@ Zed extension: `.http` request files (REST Client / JetBrains syntax) backed by 
 ```sh
 # LSP server (run inside server/)
 cargo build                      # debug build -> server/target/debug/openapi-lsp
-cargo clippy
+cargo test
+cargo clippy --all-targets -- -D warnings   # CI runs exactly this plus `cargo test --locked`
 cargo install --path . --locked  # install to ~/.cargo/bin (what Zed actually runs)
 
 # WASM extension (repo root); Zed builds it itself on "zed: install dev extension"
@@ -24,7 +25,9 @@ cargo build --target wasm32-wasip2 --release
 tree-sitter query languages/http/highlights.scm some.http   # run from a checkout of the grammar after `tree-sitter generate`
 ```
 
-There are no tests in the repo. The server was verified with an ad-hoc Python stdio LSP client plus a mock HTTP server. After reinstalling the binary, Zed needs `editor: restart language server`.
+Tests are inline `#[cfg(test)] mod tests` at the bottom of each module in `server/src` (binary-only crate, so no `tests/*.rs`). Shared helpers are in `test_util.rs` (`spec()`, `ctx()`, `at("…|…")` cursor marker, `apply(text, edits)`); spec fixtures are in `server/tests/fixtures/`. Covered: the pure modules. `runner` (HTTP) and the `main` LSP loop have no tests; they were verified by hand with an ad-hoc Python stdio LSP client plus a mock HTTP server. `util::set_utf8_positions` is process-global: keep test text ASCII, except in the util tests, which hold `test_util::POS_LOCK`. CI: `.github/workflows/ci.yml`.
+
+After reinstalling the binary, Zed needs `editor: restart language server`.
 
 ## Server architecture (`server/src`)
 
