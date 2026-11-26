@@ -337,3 +337,119 @@ fn check(
         NodeKind::Scalar(_) => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{spec, spec_named};
+    use lsp_types::Position;
+
+    fn file(first: &str, status: &str, ct: Option<&str>, body: &str) -> String {
+        let ct = ct.map_or(String::new(), |c| format!("Content-Type: {c}\n"));
+        format!("# {first}\n# @spec /x.yaml\nHTTP/1.1 {status}\n{ct}\n{body}\n")
+    }
+
+    fn msgs(text: &str) -> Vec<String> {
+        diagnostics(text, &spec()).into_iter().map(|d| d.message).collect()
+    }
+
+    fn rng(l: u32, s: u32, e: u32) -> Range {
+        Range::new(Position::new(l, s), Position::new(l, e))
+    }
+
+    #[test]
+    fn matching_response_is_clean() {
+        let t = file("GET http://x/api/pets/1", "200 OK", Some("application/json"), r#"{"id": 1, "name": "a", "kind": "cat"}"#);
+        assert!(msgs(&t).is_empty());
+        assert_eq!(warning_count(&t, &spec()), 0);
+        let t = file("POST http://x/pets", "404 Not Found", Some("application/json"), "{}");
+        assert!(msgs(&t).is_empty());
+    }
+
+    #[test]
+    fn not_a_response_file() {
+        assert!(msgs("GET /pets\n").is_empty());
+        assert!(msgs(&file("http://x/pets/1", "500", None, "")).is_empty());
+        assert!(msgs(&file("GET http://x/unknown", "500", None, "")).is_empty());
+        assert!(msgs("# GET http://x/pets/1\nno status line\n").is_empty());
+        let t = file("GET http://x/pets/1", "200", Some("application/json"), "{broken");
+        assert!(msgs(&t).is_empty());
+    }
+
+    #[test]
+    fn undocumented_status() {
+        let t = file("GET http://x/pets/1", "500 Internal Server Error", None, "");
+        let d = diagnostics(&t, &spec());
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "Status 500 is not documented for GET /pets/{id}; documented: 200");
+        assert_eq!(d[0].range, rng(2, 0, 34));
+    }
+
+    #[test]
+    fn wrong_content_type() {
+        let t = file("GET http://x/pets/1", "200 OK", Some("text/html; charset=utf-8"), "<html/>");
+        let d = diagnostics(&t, &spec());
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "Content-Type `text/html` is not documented for status 200; expected: application/json");
+        assert_eq!(d[0].range.start.line, 3);
+        let t = file("GET http://x/pets/1", "200 OK", Some("application/problem+json"), r#"{"id": 1, "name": "a", "kind": "cat"}"#);
+        assert!(msgs(&t).is_empty());
+    }
+
+    #[test]
+    fn array_item_type_and_enum() {
+        let body = "[\n  {\"id\": 1, \"name\": \"a\", \"kind\": \"cat\"},\n  {\"id\": \"x\", \"name\": \"b\", \"kind\": \"cow\"}\n]";
+        let t = file("GET http://x/pets?limit=1", "200 OK", Some("application/json"), body);
+        let d = diagnostics(&t, &spec());
+        let got: Vec<(&str, Range)> = d.iter().map(|d| (d.message.as_str(), d.range)).collect();
+        assert_eq!(
+            got,
+            [
+                ("`1.id`: expected `integer`, got string", rng(7, 9, 12)),
+                ("`1.kind`: \"cow\" is not one of \"cat\", \"dog\"", rng(7, 35, 40)),
+            ]
+        );
+        assert_eq!(warning_count(&t, &spec()), 2);
+    }
+
+    #[test]
+    fn missing_and_undocumented_fields() {
+        let t = file("GET http://x/pets/1", "200 OK", Some("application/json"), r#"{"name": "a", "kind": "cat", "extra": 1}"#);
+        let d = diagnostics(&t, &spec());
+        assert_eq!(d[0].message, "missing required field `id`");
+        assert_eq!(d[0].range, rng(5, 0, 1));
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(d[1].message, "`extra` is not documented in `Pet`");
+        assert_eq!(d[1].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(warning_count(&t, &spec()), 1);
+    }
+
+    #[test]
+    fn nested_and_nullable() {
+        let t = file(
+            "GET http://x/owners/o1",
+            "200 OK",
+            Some("application/json"),
+            r#"{"id": "o1", "pets": [{"id": 1.5, "name": "a", "kind": "cat"}]}"#,
+        );
+        assert_eq!(msgs(&t), ["`pets.0.id`: expected `integer`, got number"]);
+
+        let s = spec_named("minimal.json");
+        let t = file("GET http://localhost:8080/items", "200 OK", Some("application/json"), r#"{"count": null, "note": null}"#);
+        let m: Vec<String> = diagnostics(&t, &s).into_iter().map(|d| d.message).collect();
+        assert_eq!(m, ["`count`: null, but `integer` is not nullable"]);
+        let t = file("GET http://localhost:8080/items", "200 OK", Some("application/json"), r#"{"count": 2.0, "note": "x"}"#);
+        assert!(diagnostics(&t, &s).is_empty());
+    }
+
+    #[test]
+    fn caps_the_number_of_diagnostics() {
+        let body = format!("[{}]", vec!["1"; 205].join(","));
+        let t = file("GET http://x/pets", "200 OK", Some("application/json"), &body);
+        let d = diagnostics(&t, &spec());
+        assert_eq!(d.len(), MAX_DIAGNOSTICS + 1);
+        assert_eq!(d[0].message, "`0`: expected `Pet`, got number");
+        assert_eq!(d.last().unwrap().message, "… and 5 more spec issues");
+        assert_eq!(warning_count(&t, &spec()), 205);
+    }
+}

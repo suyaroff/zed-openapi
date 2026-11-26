@@ -348,3 +348,209 @@ fn validate(
         NodeKind::Scalar(_) => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_parser::parse;
+    use crate::test_util::{apply, ctx, spec};
+
+    fn run(text: &str) -> Vec<Finding> {
+        let file = parse(text);
+        let mut cx = ctx(&[("baseUrl", "http://x")]);
+        cx.file_vars = file.vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect();
+        compute(text, &file, Some(&spec()), &cx)
+    }
+
+    fn messages(text: &str) -> Vec<String> {
+        run(text).into_iter().map(|f| f.diag.message).collect()
+    }
+
+    fn only(text: &str) -> Finding {
+        let mut f = run(text);
+        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|f| &f.diag.message).collect::<Vec<_>>());
+        f.remove(0)
+    }
+
+    fn fixed(text: &str, f: &Finding, title: &str) -> String {
+        let fix = f.fixes.iter().find(|x| x.title == title).unwrap_or_else(|| {
+            panic!("no fix {title:?}; have {:?}", f.fixes.iter().map(|x| &x.title).collect::<Vec<_>>())
+        });
+        apply(text, &fix.edits)
+    }
+
+    fn rng(l: u32, s: u32, e: u32) -> Range {
+        Range::new(Position::new(l, s), Position::new(l, e))
+    }
+
+    #[test]
+    fn valid_requests_have_no_findings() {
+        assert!(messages("GET {{baseUrl}}/pets?limit=5\nX-Tenant: eu\n").is_empty());
+        assert!(messages("POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\"name\": \"a\", \"kind\": \"cat\"}\n").is_empty());
+        assert_eq!(messages("@n = \"x\"\nPOST {{baseUrl}}/pets\n\n{\"name\": {{n}}, \"kind\": \"dog\", \"tags\": [{{n}}]}\n"), Vec::<String>::new());
+        assert!(messages("POST {{baseUrl}}/pets\nContent-Type: text/plain\n\nnot json\n").is_empty());
+        assert!(messages("GET {{baseUrl}}/health\n").is_empty());
+    }
+
+    #[test]
+    fn undefined_variable_with_define_fix() {
+        let text = "@a = 1\n\nGET {{baseUrl}}/pets/{{petId}}\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "Variable `petId` is not defined in env `dev`");
+        assert_eq!(f.diag.range, rng(2, 21, 30));
+        assert!(f.fixes[0].preferred);
+        assert_eq!(fixed(text, &f, "Define `@petId` in this file"), "@a = 1\n@petId = \n\nGET {{baseUrl}}/pets/{{petId}}\n");
+
+        let text = "GET {{baseUrl}}/pets/{{id}}\n";
+        assert_eq!(fixed(text, &only(text), "Define `@id` in this file"), "@id = \nGET {{baseUrl}}/pets/{{id}}\n");
+    }
+
+    #[test]
+    fn dynamic_and_captured_variables() {
+        assert!(messages("GET {{baseUrl}}/pets/{{$randomInt}}\n").is_empty());
+        // Unknown `$` names are treated as dynamic and not reported.
+        assert!(messages("GET {{baseUrl}}/pets/{{$nope}}\n").is_empty());
+        let text = "# @capture tok = data.token\nGET {{baseUrl}}/health\n\n###\nGET {{baseUrl}}/health\nAuthorization: Bearer {{tok}}\n";
+        assert!(messages(text).is_empty());
+    }
+
+    #[test]
+    fn variables_checked_without_spec() {
+        let text = "GET {{host}}/anything\n";
+        let f = compute(text, &parse(text), None, &ctx(&[]));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].diag.source.as_deref(), Some("openapi"));
+    }
+
+    #[test]
+    fn wrong_method() {
+        let text = "PUT {{baseUrl}}/pets/1\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "PUT is not defined for /pets/{id}; allowed: GET, DELETE");
+        assert_eq!(f.diag.range, rng(0, 4, 22));
+        assert!(f.fixes.iter().all(|x| !x.preferred));
+        assert_eq!(fixed(text, &f, "Change method to DELETE"), "DELETE {{baseUrl}}/pets/1\n");
+
+        let text = "  {{baseUrl}}/login\n";
+        let f = only(text);
+        assert!(f.fixes[0].preferred);
+        assert_eq!(fixed(text, &f, "Change method to POST"), "  POST {{baseUrl}}/login\n");
+    }
+
+    #[test]
+    fn unknown_path() {
+        let text = "GET {{baseUrl}}/pet/5?x=1\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "No matching path in the OpenAPI spec");
+        assert_eq!(fixed(text, &f, "Change path to GET /pets/{id}"), "GET {{baseUrl}}/pets/5?x=1\n");
+        assert!(f.fixes.iter().all(|x| !x.preferred));
+    }
+
+    #[test]
+    fn missing_required_query() {
+        let text = "GET {{baseUrl}}/pets\nX-Tenant: eu\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "Missing required query parameter `limit`");
+        assert_eq!(fixed(text, &f, "Add query parameter `limit`"), "GET {{baseUrl}}/pets?limit=\nX-Tenant: eu\n");
+
+        let text = "GET {{baseUrl}}/pets?status=sold\nX-Tenant: eu\n";
+        assert_eq!(fixed(text, &only(text), "Add query parameter `limit`"), "GET {{baseUrl}}/pets?status=sold&limit=\nX-Tenant: eu\n");
+
+        let text = "GET {{baseUrl}}/pets\n    ?status=sold\nX-Tenant: eu\n";
+        assert_eq!(
+            fixed(text, &only(text), "Add query parameter `limit`"),
+            "GET {{baseUrl}}/pets\n    ?status=sold\n    &limit=\nX-Tenant: eu\n"
+        );
+    }
+
+    #[test]
+    fn missing_required_header() {
+        let text = "GET {{baseUrl}}/pets?limit=1\nAccept: */*\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "Missing required header parameter `X-Tenant`");
+        assert_eq!(fixed(text, &f, "Add header parameter `X-Tenant`"), "GET {{baseUrl}}/pets?limit=1\nAccept: */*\nX-Tenant: \n");
+
+        let text = "GET {{baseUrl}}/pets?limit=1\n";
+        assert_eq!(fixed(text, &only(text), "Add header parameter `X-Tenant`"), "GET {{baseUrl}}/pets?limit=1\nX-Tenant: \n");
+        assert!(messages("GET {{baseUrl}}/pets?limit=1\nx-tenant: us\n").is_empty());
+    }
+
+    #[test]
+    fn missing_body() {
+        let text = "POST {{baseUrl}}/pets\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "Request body is required");
+        assert_eq!(
+            fixed(text, &f, "Add body from schema"),
+            "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"\",\n  \"kind\": \"cat\"\n}\n"
+        );
+        let text = "POST {{baseUrl}}/pets\nContent-Type: application/json\n";
+        assert_eq!(
+            fixed(text, &only(text), "Add body from schema"),
+            "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"\",\n  \"kind\": \"cat\"\n}\n"
+        );
+        // Optional form body: nothing to report.
+        assert!(messages("POST {{baseUrl}}/login\n").is_empty());
+    }
+
+    #[test]
+    fn invalid_json_points_at_error_line() {
+        let text = "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"a\",\n  \"kind\": \n}\n";
+        let f = only(text);
+        assert!(f.diag.message.starts_with("Invalid JSON: "), "{}", f.diag.message);
+        assert_eq!(f.diag.range.start.line, 6);
+    }
+
+    #[test]
+    fn missing_required_fields() {
+        let text = "POST {{baseUrl}}/pets\n\n{\"vaccinated\": true}\n";
+        let f = run(text);
+        let msgs: Vec<&str> = f.iter().map(|f| f.diag.message.as_str()).collect();
+        assert_eq!(msgs, ["Missing required field `name`", "Missing required field `kind`"]);
+        assert_eq!(f[0].diag.range, rng(2, 0, 1));
+        assert_eq!(fixed(text, &f[0], "Add field `name`"), "POST {{baseUrl}}/pets\n\n{\"vaccinated\": true, \"name\": \"\"}\n");
+        assert_eq!(
+            fixed(text, &f[1], "Add all 2 missing required fields"),
+            "POST {{baseUrl}}/pets\n\n{\"vaccinated\": true, \"name\": \"\", \"kind\": \"cat\"}\n"
+        );
+
+        let text = "POST {{baseUrl}}/pets\n\n{\n  \"vaccinated\": true\n}\n";
+        assert_eq!(
+            fixed(text, &run(text)[0], "Add all 2 missing required fields"),
+            "POST {{baseUrl}}/pets\n\n{\n  \"vaccinated\": true,\n  \"name\": \"\",\n  \"kind\": \"cat\"\n}\n"
+        );
+
+        let text = "POST {{baseUrl}}/pets\n\n{}\n";
+        assert_eq!(fixed(text, &run(text)[0], "Add field `name`"), "POST {{baseUrl}}/pets\n\n{\"name\": \"\"}\n");
+    }
+
+    #[test]
+    fn unknown_fields() {
+        let text = "POST {{baseUrl}}/pets\n\n{\"name\": \"a\", \"kind\": \"cat\", \"color\": \"red\"}\n";
+        let f = only(text);
+        assert_eq!(f.diag.message, "Unknown field `color` for `NewPet`");
+        assert_eq!(f.diag.range, rng(2, 29, 36));
+        assert_eq!(fixed(text, &f, "Remove field `color`"), "POST {{baseUrl}}/pets\n\n{\"name\": \"a\", \"kind\": \"cat\"}\n");
+
+        let text = "POST {{baseUrl}}/pets\n\n{\"name\": \"a\", \"color\": \"red\", \"kind\": \"cat\"}\n";
+        assert_eq!(fixed(text, &only(text), "Remove field `color`"), "POST {{baseUrl}}/pets\n\n{\"name\": \"a\", \"kind\": \"cat\"}\n");
+
+        let text = "POST {{baseUrl}}/pets\n\n{\"color\": 1}\n";
+        let f = run(text);
+        let unknown = f.iter().find(|f| f.diag.message.starts_with("Unknown")).unwrap();
+        assert_eq!(fixed(text, unknown, "Remove field `color`"), "POST {{baseUrl}}/pets\n\n{}\n");
+    }
+
+    #[test]
+    fn nested_unknown_field() {
+        let text = "POST {{baseUrl}}/pets\n\n{\"name\": \"a\", \"kind\": \"cat\", \"category\": {\"id\": 1, \"x\": 2}}\n";
+        assert_eq!(messages(text), ["Unknown field `x` for `Category`"]);
+    }
+
+    #[test]
+    fn invalid_expect() {
+        let f = only("# @expect status\nGET {{baseUrl}}/health\n");
+        assert_eq!(f.diag.message, "@expect: missing comparison, e.g. `status 200` or `time < 500`");
+        assert_eq!(f.diag.range, rng(0, 0, 16));
+    }
+}

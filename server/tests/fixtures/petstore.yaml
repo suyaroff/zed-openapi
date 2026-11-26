@@ -1,0 +1,176 @@
+openapi: 3.0.3
+info:
+  title: Petstore
+  version: "1.0"
+servers:
+  - url: https://pets.example.com/api/
+tags:
+  - name: pets
+  - name: owners
+security:
+  - bearerAuth: []
+paths:
+  /pets:
+    get:
+      tags: [pets]
+      summary: List pets
+      operationId: listPets
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 100 }
+        - name: status
+          in: query
+          schema: { type: string, enum: [available, sold] }
+        - name: tags
+          in: query
+          schema:
+            type: array
+            items: { type: string, enum: [cat, dog] }
+        - name: X-Tenant
+          in: header
+          required: true
+          schema: { type: string, enum: [eu, us] }
+      responses:
+        "200":
+          description: Pets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Pet" }
+    post:
+      tags: [pets]
+      summary: Create pet
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewPet" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+        "4XX":
+          description: Client error
+  /pets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [pets]
+      summary: Get pet
+      operationId: getPet
+      security: []
+      responses:
+        "200":
+          description: Pet
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+    delete:
+      tags: [pets]
+      operationId: delete pet!
+      responses:
+        "204":
+          description: Deleted
+  /pets/{id}/photos:
+    get:
+      tags: [pets]
+      summary: Pet photos
+      responses:
+        "200":
+          description: Photos
+  /pets/mine/photos:
+    get:
+      tags: [pets]
+      summary: My photos
+      responses:
+        "200":
+          description: Photos
+  /owners/{ownerId}:
+    get:
+      tags: [owners]
+      operationId: getOwner
+      parameters:
+        - name: ownerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: verbose
+          in: query
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: Owner
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Owner" }
+  /login:
+    post:
+      summary: Log in
+      operationId: login
+      security: []
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                user: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: Token
+  /health:
+    get:
+      summary: Health
+      security: []
+      responses:
+        "200":
+          description: OK
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+    NewPet:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      properties:
+        name: { type: string, minLength: 1, description: Pet name }
+        kind: { type: string, enum: [cat, dog] }
+        vaccinated: { type: boolean }
+        category: { $ref: "#/components/schemas/Category" }
+        tags:
+          type: array
+          items: { type: string }
+    Pet:
+      allOf:
+        - $ref: "#/components/schemas/NewPet"
+        - type: object
+          required: [id]
+          properties:
+            id: { type: integer, readOnly: true }
+            owner: { $ref: "#/components/schemas/Owner" }
+    Owner:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        pets:
+          type: array
+          items: { $ref: "#/components/schemas/Pet" }

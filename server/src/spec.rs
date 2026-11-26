@@ -553,3 +553,264 @@ fn seg_distance(op: &[Seg], req: &[&str]) -> usize {
     prev[req.len()]
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{spec, spec_named};
+    use serde_json::json;
+
+    fn exact(s: &Spec, method: &str, url: &str) -> String {
+        match s.find(method, url) {
+            Match::Exact(op) => format!("{} {}", op.method, op.path),
+            Match::WrongMethod(ops) => panic!("{method} {url}: wrong method, have {:?}", ops),
+            Match::None => panic!("{method} {url}: no match"),
+        }
+    }
+
+    #[test]
+    fn loads_yaml_and_json() {
+        let s = spec();
+        let ops: Vec<String> = s.ops.iter().map(|o| format!("{} {}", o.method, o.path)).collect();
+        assert_eq!(
+            ops,
+            [
+                "GET /pets",
+                "POST /pets",
+                "GET /pets/{id}",
+                "DELETE /pets/{id}",
+                "GET /pets/{id}/photos",
+                "GET /pets/mine/photos",
+                "GET /owners/{ownerId}",
+                "POST /login",
+                "GET /health",
+            ]
+        );
+        assert_eq!(spec_named("minimal.json").ops.len(), 2);
+        assert!(Spec::load(Path::new("/nonexistent.yaml")).is_err());
+    }
+
+    #[test]
+    fn url_segments_drop_host_and_query() {
+        assert_eq!(url_segments("https://h:1/api/pets?x=1#f"), ["api", "pets"]);
+        assert_eq!(url_segments("{{baseUrl}}/pets/{{id}}"), ["{{baseUrl}}", "pets", "{{id}}"]);
+        assert!(url_segments("http://h").is_empty());
+    }
+
+    #[test]
+    fn find_suffix_matches_through_prefixes() {
+        let s = spec();
+        assert_eq!(exact(&s, "GET", "{{baseUrl}}/pets?limit=1"), "GET /pets");
+        assert_eq!(exact(&s, "GET", "https://pets.example.com/api/pets/7"), "GET /pets/{id}");
+        assert_eq!(exact(&s, "GET", "/api/v2/pets/{{id}}/photos"), "GET /pets/{id}/photos");
+        assert_eq!(exact(&s, "delete", "/pets/1"), "DELETE /pets/{id}");
+    }
+
+    #[test]
+    fn find_prefers_more_literal_segments() {
+        let s = spec();
+        assert_eq!(exact(&s, "GET", "/pets/mine/photos"), "GET /pets/mine/photos");
+        assert_eq!(exact(&s, "GET", "/pets/other/photos"), "GET /pets/{id}/photos");
+    }
+
+    #[test]
+    fn find_wrong_method_and_none() {
+        let s = spec();
+        match s.find("PUT", "/pets/1") {
+            Match::WrongMethod(ops) => {
+                let m: Vec<&str> = ops.iter().map(|o| o.method.as_str()).collect();
+                assert_eq!(m, ["GET", "DELETE"]);
+            }
+            _ => panic!("expected WrongMethod"),
+        }
+        assert!(matches!(s.find("GET", "/cats"), Match::None));
+        assert!(s.find_exact("PUT", "/pets/1").is_none());
+    }
+
+    #[test]
+    fn root_path_matches_only_empty_urls() {
+        let s = spec_named("minimal.json");
+        assert_eq!(exact(&s, "GET", "http://localhost:8080"), "GET /");
+        assert_eq!(exact(&s, "GET", "/"), "GET /");
+        assert_eq!(exact(&s, "GET", "{{baseUrl}}/items"), "GET /items");
+    }
+
+    #[test]
+    fn closest_paths_keep_prefix_and_query() {
+        let s = spec();
+        let c = s.closest_paths("GET", "{{baseUrl}}/pet/5?x=1");
+        assert_eq!(c[0], ("{{baseUrl}}/pets/5?x=1".to_string(), "GET /pets/{id}".to_string()));
+        assert!(c.len() <= 3);
+        let c = s.closest_paths("GET", "https://h/api/helth");
+        assert_eq!(c[0], ("https://h/api/health".to_string(), "GET /health".to_string()));
+        assert!(s.closest_paths("GET", "/completely/unrelated/thing").is_empty());
+    }
+
+    #[test]
+    fn resolve_and_ref_names() {
+        let s = Spec {
+            root: json!({"a": {"$ref": "#/b"}, "b": {"$ref": "#/c"}, "c": {"type": "string"}, "loop": {"$ref": "#/loop"}}),
+            ops: vec![],
+        };
+        assert_eq!(s.resolve(&s.root["a"]), &json!({"type": "string"}));
+        assert_eq!(s.resolve(&json!({"$ref": "#/missing"})), &json!({"$ref": "#/missing"}));
+        assert_eq!(s.resolve(&s.root["loop"]), &json!({"$ref": "#/loop"}));
+        assert_eq!(Spec::ref_name(&json!({"$ref": "#/components/schemas/Pet"})), Some("Pet"));
+        assert_eq!(Spec::ref_name(&json!({})), None);
+    }
+
+    #[test]
+    fn base_url_trims_slash() {
+        assert_eq!(spec().base_url().as_deref(), Some("https://pets.example.com/api"));
+        assert_eq!(spec_named("minimal.json").base_url().as_deref(), Some("http://localhost:8080"));
+    }
+
+    #[test]
+    fn params_merge_path_item_and_operation() {
+        let s = spec();
+        let names = |m: &str, u: &str| -> Vec<String> {
+            let op = s.find_exact(m, u).unwrap();
+            s.params(op).iter().map(|p| p["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(names("GET", "/pets/1"), ["id"]);
+        assert_eq!(names("GET", "/pets"), ["limit", "status", "tags", "X-Tenant"]);
+
+        let s = Spec {
+            root: json!({"paths": {"/a": {
+                "parameters": [{"name": "x", "in": "query", "description": "path"}, {"name": "y", "in": "query"}],
+                "get": {"parameters": [{"name": "x", "in": "query", "description": "op"}, {"name": "x", "in": "header"}]}
+            }}}),
+            ops: vec![Op { method: "GET".into(), path: "/a".into(), segs: parse_segs("/a") }],
+        };
+        let p = s.params(&s.ops[0]);
+        let keys: Vec<(&str, &str)> = p.iter().map(|p| (p["name"].as_str().unwrap(), p["in"].as_str().unwrap())).collect();
+        assert_eq!(keys, [("y", "query"), ("x", "query"), ("x", "header")]);
+        assert_eq!(p[1]["description"], "op");
+    }
+
+    #[test]
+    fn request_body_schema() {
+        let s = spec();
+        let op = s.find_exact("POST", "/pets").unwrap();
+        let ref_ = json!({"$ref": "#/components/schemas/NewPet"});
+        assert_eq!(s.body_media(op).unwrap().0, "application/json");
+        assert_eq!(s.body_schema_for(op, Some("application/json; charset=utf-8")), Some(&ref_));
+        assert_eq!(s.body_schema_for(op, Some("text/plain")), Some(&ref_));
+        assert_eq!(s.body_schema_for(op, None), Some(&ref_));
+        assert!(s.body_schema_for(s.find_exact("GET", "/pets").unwrap(), None).is_none());
+    }
+
+    #[test]
+    fn security_and_bearer() {
+        let s = spec();
+        let list = s.find_exact("GET", "/pets").unwrap();
+        let get = s.find_exact("GET", "/pets/1").unwrap();
+        assert_eq!(s.security(list), ["bearerAuth"]);
+        assert!(s.needs_bearer(list));
+        assert!(s.security(get).is_empty());
+        assert!(!s.needs_bearer(get));
+
+        let s = Spec {
+            root: json!({
+                "components": {"securitySchemes": {"o": {"type": "oauth2"}, "k": {"type": "apiKey"}}},
+                "paths": {"/a": {"get": {"security": [{"k": []}]}, "post": {"security": [{"k": []}, {"o": []}]}}}
+            }),
+            ops: vec![
+                Op { method: "GET".into(), path: "/a".into(), segs: vec![] },
+                Op { method: "POST".into(), path: "/a".into(), segs: vec![] },
+            ],
+        };
+        assert!(!s.needs_bearer(&s.ops[0]));
+        assert!(s.needs_bearer(&s.ops[1]));
+    }
+
+    #[test]
+    fn object_view_merges_all_of() {
+        let s = spec();
+        let pet = &s.root["components"]["schemas"]["Pet"];
+        let v = s.object_view(pet);
+        let props: Vec<&str> = v.props.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(props, ["name", "kind", "vaccinated", "category", "tags", "id", "owner"]);
+        assert_eq!(v.required, ["name", "kind", "id"]);
+        assert!(v.closed);
+        assert!(v.prop("owner").is_some());
+        assert!(v.prop("nope").is_none());
+        let cat = s.object_view(&s.root["components"]["schemas"]["Category"]);
+        assert!(!cat.closed && cat.additional.is_none());
+    }
+
+    #[test]
+    fn child_and_schema_at() {
+        let s = spec();
+        let owner = json!({"$ref": "#/components/schemas/Owner"});
+        let path = [PathElem::Key("pets".into()), PathElem::Index, PathElem::Key("name".into())];
+        assert_eq!(s.schema_at(&owner, &path).unwrap()["type"], "string");
+        assert!(s.schema_at(&owner, &[PathElem::Key("nope".into())]).is_none());
+        assert!(s.is_array(&s.root["components"]["schemas"]["Owner"]["properties"]["pets"]));
+        assert!(!s.is_array(&owner));
+
+        let s = Spec {
+            root: json!({
+                "map": {"type": "object", "additionalProperties": {"type": "integer"}},
+                "one": {"oneOf": [{"type": "object", "properties": {"a": {"type": "string"}}}, {"type": "array", "items": {"type": "boolean"}}]}
+            }),
+            ops: vec![],
+        };
+        assert_eq!(s.child(&s.root["map"], &PathElem::Key("any".into())).unwrap()["type"], "integer");
+        assert_eq!(s.child(&s.root["one"], &PathElem::Key("a".into())).unwrap()["type"], "string");
+        assert_eq!(s.child(&s.root["one"], &PathElem::Index).unwrap()["type"], "boolean");
+    }
+
+    #[test]
+    fn type_labels() {
+        let s = Spec {
+            root: json!({"components": {"schemas": {"Id": {"type": "string", "format": "uuid"}, "Obj": {"type": "object"}}}}),
+            ops: vec![],
+        };
+        let l = |v: Value| s.type_label(&v);
+        assert_eq!(l(json!({"$ref": "#/components/schemas/Id"})), "Id: string(uuid)");
+        assert_eq!(l(json!({"$ref": "#/components/schemas/Obj"})), "Obj");
+        assert_eq!(l(json!({"type": "array", "items": {"type": "integer"}})), "integer[]");
+        assert_eq!(l(json!({"type": ["string", "null"]})), "string | null");
+        assert_eq!(l(json!({"type": "string", "nullable": true})), "string?");
+        assert_eq!(l(json!({"oneOf": [{"type": "string"}, {"type": "integer"}]})), "string | integer");
+        assert_eq!(l(json!({"allOf": [{"$ref": "#/components/schemas/Obj"}]})), "Obj");
+        assert_eq!(l(json!({"properties": {}})), "object");
+        assert_eq!(l(json!({})), "any");
+    }
+
+    #[test]
+    fn skeletons() {
+        let s = spec();
+        let new_pet = json!({"$ref": "#/components/schemas/NewPet"});
+        assert_eq!(s.skeleton(&new_pet, 0, false), json!({"name": "", "kind": "cat"}));
+        assert_eq!(
+            s.skeleton(&new_pet, 0, true),
+            json!({"name": "", "kind": "cat", "vaccinated": false, "category": {"id": 0, "name": ""}, "tags": [""]})
+        );
+        // readOnly `id` is required but never synthesized.
+        assert_eq!(s.skeleton(&json!({"$ref": "#/components/schemas/Pet"}), 0, false), json!({"name": "", "kind": "cat"}));
+        assert_eq!(s.skeleton(&json!({"type": "string", "format": "date-time"}), 0, false), "2026-01-01T00:00:00Z");
+        assert_eq!(s.skeleton(&json!({"type": "integer", "example": 7, "default": 3}), 0, false), 7);
+        assert_eq!(s.skeleton(&json!({"type": "integer", "default": 3}), 0, false), 3);
+        assert_eq!(s.skeleton(&json!({"oneOf": [{"type": "boolean"}]}), 0, false), false);
+        assert_eq!(s.skeleton(&json!({"type": "array", "items": {"type": "integer"}}), 4, false), json!([]));
+    }
+
+    #[test]
+    fn media_examples() {
+        assert_eq!(Spec::media_example(&json!({"example": 1})), Some(&json!(1)));
+        assert_eq!(Spec::media_example(&json!({"examples": {"a": {"value": {"x": 1}}}})), Some(&json!({"x": 1})));
+        assert_eq!(Spec::media_example(&json!({})), None);
+    }
+
+    #[test]
+    fn distances() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        let op = parse_segs("/pets/{id}");
+        assert_eq!(seg_distance(&op, &["pets", "5"]), 0);
+        assert_eq!(seg_distance(&op, &["pet", "{{id}}"]), 1);
+        assert_eq!(seg_distance(&op, &["pets"]), 2);
+    }
+}

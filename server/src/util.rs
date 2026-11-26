@@ -115,3 +115,98 @@ pub fn one_line(s: &str, max: usize) -> String {
         flat
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::POS_LOCK;
+
+    struct Mode {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Mode {
+        fn utf8(v: bool) -> Mode {
+            let guard = POS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            set_utf8_positions(v);
+            Mode { _guard: guard }
+        }
+    }
+
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            set_utf8_positions(false);
+        }
+    }
+
+    #[test]
+    fn utf16_positions_count_code_units() {
+        let _m = Mode::utf8(false);
+        let line = "ab привет 😀x";
+        let emoji = line.find('😀').unwrap();
+        assert_eq!(byte_to_lsp(line, 3), 3);
+        assert_eq!(byte_to_lsp(line, emoji), 10);
+        assert_eq!(byte_to_lsp(line, emoji + 4), 12);
+        assert_eq!(lsp_to_byte(line, 12), emoji + 4);
+        assert_eq!(lsp_to_byte(line, 999), line.len());
+        for (b, _) in line.char_indices() {
+            assert_eq!(lsp_to_byte(line, byte_to_lsp(line, b)), b);
+        }
+    }
+
+    #[test]
+    fn utf8_positions_are_bytes() {
+        let _m = Mode::utf8(true);
+        let line = "ab привет";
+        assert_eq!(byte_to_lsp(line, 5), 5);
+        assert_eq!(lsp_to_byte(line, 5), 5);
+        // Mid-character offsets snap back to the char start.
+        assert_eq!(lsp_to_byte(line, 4), 3);
+        assert_eq!(byte_to_lsp(line, 4), 3);
+    }
+
+    #[test]
+    fn mid_char_byte_floors_in_utf16() {
+        let _m = Mode::utf8(false);
+        assert_eq!(byte_to_lsp("жx", 1), 0);
+        assert_eq!(byte_to_lsp("жx", 100), 2);
+    }
+
+    #[test]
+    fn ranges_on_lines() {
+        let _m = Mode::utf8(false);
+        let lines = ["GET /", "ж = 1"];
+        assert_eq!(range_on_line(&lines, 0, 4, 5), Range::new(Position::new(0, 4), Position::new(0, 5)));
+        assert_eq!(full_line(&lines, 1), Range::new(Position::new(1, 0), Position::new(1, 5)));
+        assert_eq!(full_line(&lines, 7), Range::new(Position::new(7, 0), Position::new(7, 0)));
+    }
+
+    #[test]
+    fn split_lines_strips_cr() {
+        assert_eq!(split_lines("a\r\nb\n\nc"), vec!["a", "b", "", "c"]);
+        assert_eq!(split_lines(""), vec![""]);
+        assert_eq!(split_lines("a\n"), vec!["a", ""]);
+    }
+
+    #[test]
+    fn uri_path_round_trip() {
+        let p = Path::new("/home/u/my api/файл#1.http");
+        let uri = path_to_uri(p);
+        assert!(uri.as_str().starts_with("file:///home/u/my%20api/"));
+        assert!(!uri.as_str().contains('#'));
+        assert_eq!(uri_to_path(&uri).unwrap(), p);
+        assert_eq!(uri_to_path(&Uri::from_str("untitled:x").unwrap()), None);
+    }
+
+    #[test]
+    fn snippet_escape_escapes_specials() {
+        assert_eq!(snippet_escape(r"a$b}c\d{e"), r"a\$b\}c\\d{e");
+    }
+
+    #[test]
+    fn one_line_flattens_and_truncates() {
+        assert_eq!(one_line("  a\n  b\tc ", 10), "a b c");
+        assert_eq!(one_line("привет мир", 6), "привет…");
+        assert_eq!(one_line("abc", 3), "abc");
+    }
+}

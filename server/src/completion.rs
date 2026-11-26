@@ -679,3 +679,221 @@ fn body(cx: &Cx, req: &Request, spec: Option<&Spec>) -> Vec<CompletionItem> {
         .collect()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_parser::parse;
+    use crate::test_util::{at, ctx, spec};
+    use crate::util::split_lines;
+    use lsp_types::{Position, Range};
+
+    fn items_with(src: &str, spec: Option<&Spec>) -> Vec<CompletionItem> {
+        let (text, line, col) = at(src);
+        let lines = split_lines(&text);
+        complete(&parse(&text), &lines, line, col, spec, &ctx(&[("baseUrl", "http://x"), ("token", "t")]))
+    }
+
+    fn items(src: &str) -> Vec<CompletionItem> {
+        items_with(src, Some(&spec()))
+    }
+
+    fn labels(src: &str) -> Vec<String> {
+        items(src).into_iter().map(|i| i.label).collect()
+    }
+
+    fn edit(item: &CompletionItem) -> (Range, &str) {
+        match item.text_edit.as_ref().expect("text edit") {
+            CompletionTextEdit::Edit(e) => (e.range, e.new_text.as_str()),
+            CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert/replace edit"),
+        }
+    }
+
+    fn find<'a>(items: &'a [CompletionItem], label: &str) -> &'a CompletionItem {
+        items.iter().find(|i| i.label == label).unwrap_or_else(|| panic!("no {label}"))
+    }
+
+    fn rng(l: u32, s: u32, e: u32) -> Range {
+        Range::new(Position::new(l, s), Position::new(l, e))
+    }
+
+    #[test]
+    fn variables_after_open_braces() {
+        let it = items("GET {{ba|");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["baseUrl", "token", "$uuid", "$timestamp", "$randomInt", "$env."]);
+        assert_eq!(edit(&it[0]), (rng(0, 6, 8), "baseUrl}}"));
+        assert_eq!(edit(find(&it, "$env.")).1, "$env.");
+        assert_eq!(it[0].detail.as_deref(), Some("env: http://x"));
+
+        let it = items("GET {{ba|}}/pets");
+        assert_eq!(edit(&it[0]).1, "baseUrl");
+        assert_eq!(edit(find(&it, "$uuid")).1, "$uuid");
+    }
+
+    #[test]
+    fn operations_on_empty_line() {
+        let it = items("|");
+        assert_eq!(it.len(), spec().ops.len());
+        assert_eq!(it[0].label, "GET /pets");
+        assert_eq!(edit(&it[0]), (rng(0, 0, 0), "GET {{baseUrl}}/pets?limit=${1}\nX-Tenant: ${2}$0"));
+        assert_eq!(edit(find(&it, "GET /pets/{id}")).1, "GET {{baseUrl}}/pets/${1:id}$0");
+        assert_eq!(
+            edit(find(&it, "POST /pets")).1,
+            "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"\",\n  \"kind\": \"cat\"\n\\}$0"
+        );
+        assert_eq!(find(&it, "POST /pets").detail.as_deref(), Some("Create pet"));
+
+        let none: Vec<String> = items_with("|", None).into_iter().map(|i| i.label).collect();
+        assert_eq!(none, METHODS);
+    }
+
+    #[test]
+    fn method_position_replaces_line() {
+        let it = items("GE|T /x");
+        assert_eq!(edit(&it[0]).0, rng(0, 0, 6));
+        // With headers below, only the request line is inserted.
+        let it = items("GE|\nAccept: */*\n");
+        assert_eq!(edit(&it[0]).1, "GET {{baseUrl}}/pets?limit=${1}");
+    }
+
+    #[test]
+    fn comments_and_directives() {
+        assert!(items("# note |").is_empty());
+        assert!(items("@var = |").is_empty());
+        let it = items("# @ti|");
+        let names: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(names, DIRECTIVES.iter().map(|d| d.0).collect::<Vec<_>>());
+        assert_eq!(edit(find(&it, "timeout")), (rng(0, 3, 5), "timeout"));
+        assert_eq!(labels("// @|"), DIRECTIVES.iter().map(|d| d.0).collect::<Vec<_>>());
+        assert!(items("# @timeout 5|").is_empty());
+
+        let it = items("# @auth l|\n\n###\n# @name login\nPOST /login\n\n###\nGET /x\n");
+        assert_eq!(it.len(), 1);
+        assert_eq!(it[0].detail.as_deref(), Some("POST /login"));
+        assert_eq!(edit(&it[0]), (rng(0, 8, 9), "login"));
+    }
+
+    #[test]
+    fn paths_for_method() {
+        let it = items("GET {{baseUrl}}/pe|");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["/pets", "/pets/{id}", "/pets/{id}/photos", "/pets/mine/photos", "/owners/{ownerId}", "/health"]);
+        assert_eq!(edit(&it[0]), (rng(0, 15, 18), "/pets?limit=${1}"));
+        assert_eq!(edit(&it[1]).1, "/pets/${1:id}");
+        assert!(labels("POST {{baseUrl}}/|").contains(&"/login".to_string()));
+        assert!(!labels("POST {{baseUrl}}/|").contains(&"/health".to_string()));
+    }
+
+    #[test]
+    fn paths_keep_base_path() {
+        let it = items("GET https://pets.example.com/api/pe|");
+        assert_eq!(edit(&it[0]).0, rng(0, 32, 35));
+        let it = items("GET {{baseUrl}}/api/|");
+        assert_eq!(edit(&it[0]).0, rng(0, 19, 20));
+        let it = items("GET /api/v2/pets/1/ph|");
+        assert_eq!(edit(find(&it, "/pets/{id}/photos")).0, rng(0, 11, 21));
+    }
+
+    #[test]
+    fn query_params_skip_used() {
+        let it = items("GET {{baseUrl}}/pets?|");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["limit", "status", "tags"]);
+        assert_eq!(edit(&it[0]), (rng(0, 21, 21), "limit="));
+        assert_eq!(it[0].detail.as_deref(), Some("integer"));
+        assert_eq!(labels("GET {{baseUrl}}/pets?limit=1&|"), ["status", "tags"]);
+        assert_eq!(labels("GET {{baseUrl}}/pets?limit=1&st|"), ["status", "tags"]);
+        assert!(items("GET {{baseUrl}}/nothing?|").is_empty());
+    }
+
+    #[test]
+    fn query_values() {
+        let it = items("GET {{baseUrl}}/pets?status=|");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["available", "sold"]);
+        assert_eq!(edit(&it[0]).0, rng(0, 28, 28));
+        let it = items("GET {{baseUrl}}/pets?tags=c|at&limit=1");
+        assert_eq!(it.len(), 2);
+        assert_eq!(edit(&it[0]), (rng(0, 26, 29), "cat"));
+        assert_eq!(labels("GET {{baseUrl}}/owners/1?verbose=|"), ["true", "false"]);
+        assert!(items("GET {{baseUrl}}/pets?limit=|").is_empty());
+        assert!(items("GET {{baseUrl}}/pets?nope=|").is_empty());
+    }
+
+    #[test]
+    fn header_names() {
+        let it = items("GET {{baseUrl}}/pets?limit=1\nX-|\n");
+        assert_eq!(it[0].label, "X-Tenant");
+        assert!(it[0].documentation.is_some());
+        assert_eq!(edit(&it[0]), (rng(1, 0, 2), "X-Tenant: "));
+        assert!(it.iter().any(|i| i.label == "Accept"));
+
+        let l = labels("GET {{baseUrl}}/pets?limit=1\nX-Tenant: eu\nAccept: */*\n|\n");
+        assert!(!l.contains(&"X-Tenant".to_string()));
+        assert!(!l.contains(&"Accept".to_string()));
+        assert!(l.contains(&"Authorization".to_string()));
+    }
+
+    #[test]
+    fn header_values() {
+        let it = items("GET {{baseUrl}}/pets?limit=1\nX-Tenant: |\n");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["eu", "us"]);
+        assert_eq!(edit(&it[0]).0, rng(1, 10, 10));
+
+        let l = labels("POST {{baseUrl}}/pets\nContent-Type: |\n");
+        assert_eq!(l[0], "application/json");
+        assert_eq!(l.iter().filter(|v| *v == "application/json").count(), 1);
+        assert_eq!(labels("GET /x\nAuthorization: Be|\n"), ["Bearer {{token}}"]);
+        assert_eq!(labels("GET /x\nConnection: |\n"), ["keep-alive", "close"]);
+        assert!(labels("GET /x\nX-Unknown: |\n").is_empty());
+    }
+
+    #[test]
+    fn body_keys() {
+        let src = "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"a\",\n  |\n}";
+        let it = items(src);
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["kind", "vaccinated", "category", "tags"]);
+        assert_eq!(edit(&it[0]), (rng(5, 2, 2), "\"kind\": \"$1\""));
+        assert_eq!(it[0].sort_text.as_deref(), Some("0kind"));
+        assert_eq!(it[0].detail.as_deref(), Some("string · required"));
+        assert_eq!(edit(&it[1]).1, "\"vaccinated\": ${1:false}");
+        assert_eq!(edit(&it[2]).1, "\"category\": {$1}");
+        assert_eq!(edit(&it[3]).1, "\"tags\": [$1]");
+
+        let it = items("POST {{baseUrl}}/pets\n\n{\"category\": {\"i|\"}}");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["id", "name"]);
+        assert_eq!(edit(&it[0]).0, rng(2, 14, 17));
+    }
+
+    #[test]
+    fn body_values() {
+        let it = items("POST {{baseUrl}}/pets\n\n{\n  \"kind\": \"|\"\n}");
+        let l: Vec<&str> = it.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(l, ["\"cat\"", "\"dog\""]);
+        assert_eq!(edit(&it[0]), (rng(3, 10, 12), "\"cat\""));
+        assert_eq!(it[0].filter_text.as_deref(), Some("cat"));
+        assert_eq!(labels("POST {{baseUrl}}/pets\n\n{\"vaccinated\": t|}"), ["true", "false"]);
+        assert!(items("POST {{baseUrl}}/pets\n\n{\"name\": |}").is_empty());
+        assert!(items("POST {{baseUrl}}/nothing\n\n{|}").is_empty());
+    }
+
+    #[test]
+    fn plain_request_text() {
+        let s = spec();
+        let op = |m: &str, u: &str| s.find_exact(m, u).unwrap();
+        assert_eq!(request_text(&s, op("GET", "/pets/1")), "GET {{baseUrl}}/pets/{{id}}");
+        assert_eq!(request_text(&s, op("GET", "/pets")), "GET {{baseUrl}}/pets?limit=\nX-Tenant: ");
+        assert_eq!(
+            request_text(&s, op("POST", "/login")),
+            "POST {{baseUrl}}/login\nContent-Type: application/x-www-form-urlencoded\n\nuser=&password="
+        );
+        assert_eq!(
+            request_text(&s, op("POST", "/pets")),
+            "POST {{baseUrl}}/pets\nContent-Type: application/json\n\n{\n  \"name\": \"\",\n  \"kind\": \"cat\"\n}"
+        );
+    }
+}

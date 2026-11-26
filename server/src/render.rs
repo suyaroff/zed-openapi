@@ -238,3 +238,58 @@ pub fn field_doc(spec: &Spec, name: &str, schema: &Value, required: bool) -> Str
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::spec;
+    use serde_json::json;
+
+    #[test]
+    fn operation_markdown() {
+        let s = spec();
+        let md = operation(&s, s.find_exact("GET", "/pets").unwrap());
+        assert!(md.starts_with("### `GET` /pets\n\n**List pets**\n\n"), "{md}");
+        assert!(md.contains("Tags: `pets` · operationId: `listPets` · 🔒 bearerAuth"));
+        assert!(md.contains("- **`limit`**\\* *query* `integer` — min `1` · max `100`"));
+        assert!(md.contains("- `status` *query* `string` — one of `\"available\"`, `\"sold\"`"));
+        assert!(md.contains("- **200** Pets — `Pet[]` *application/json*"));
+        assert!(md.contains("  - **`id`**\\* `integer` — read-only"));
+
+        let md = operation(&s, s.find_exact("GET", "/health").unwrap());
+        assert!(md.contains("🔓 public"));
+        assert!(!md.contains("#### Parameters"));
+
+        let md = operation(&s, s.find_exact("POST", "/pets").unwrap());
+        assert!(md.contains("#### Body\\* `application/json` — `NewPet`"));
+        assert!(md.contains("- **`name`**\\* `string` — Pet name · min length `1`"));
+    }
+
+    #[test]
+    fn field_lines() {
+        let s = spec();
+        assert_eq!(field_line(&s, "a", &json!({"type": "string"}), false), "`a` `string`");
+        assert_eq!(
+            field_line(&s, "a", &json!({"type": "integer", "default": 3, "deprecated": true, "description": "x\n y"}), true),
+            "**`a`**\\* `integer` — x y · default `3` · **deprecated**"
+        );
+    }
+
+    #[test]
+    fn schema_tree_stops_on_cycles() {
+        let s = spec();
+        let tree = schema_tree(&s, &json!({"$ref": "#/components/schemas/Owner"}), 10);
+        assert!(tree.starts_with("- **`id`**\\* `string`\n- `pets` `Pet[]`\n"), "{tree}");
+        // Owner -> pets[] -> Pet -> owner: Owner is not expanded again.
+        let owner_lines: Vec<&str> = tree.lines().filter(|l| l.contains("`owner`")).collect();
+        assert_eq!(owner_lines, ["  - `owner` `Owner`"]);
+        assert!(!tree.lines().any(|l| l.starts_with("    - **`id`**\\* `string`")));
+    }
+
+    #[test]
+    fn param_docs_include_description() {
+        let s = spec();
+        let p = json!({"name": "q", "in": "query", "description": "Search", "example": "cat", "schema": {"type": "string"}});
+        assert_eq!(param_doc(&s, &p), "`q` *query* `string` — Search · e.g. `\"cat\"`\n\nSearch");
+    }
+}

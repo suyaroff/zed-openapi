@@ -239,3 +239,138 @@ pub fn json_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
             _ => None,
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn layered() -> Ctx {
+        Ctx {
+            env_name: "dev".into(),
+            file_vars: map(&[("a", "file")]),
+            captured: map(&[("a", "captured"), ("b", "captured")]),
+            env: map(&[("a", "env"), ("b", "env"), ("c", "env")]),
+            spec_base: Some("https://spec".into()),
+        }
+    }
+
+    #[test]
+    fn precedence() {
+        let c = layered();
+        assert_eq!(c.raw("a"), Some("file"));
+        assert_eq!(c.raw("b"), Some("captured"));
+        assert_eq!(c.raw("c"), Some("env"));
+        assert_eq!(c.raw("baseUrl"), Some("https://spec"));
+        assert_eq!(c.raw("d"), None);
+        let mut c = c;
+        c.env.insert("baseUrl".into(), "https://env".into());
+        assert_eq!(c.raw("baseUrl"), Some("https://env"));
+        assert!(c.is_defined("$uuid") && c.is_defined("a") && !c.is_defined("zzz"));
+    }
+
+    #[test]
+    fn names_report_the_winning_source() {
+        let names = layered().names();
+        assert_eq!(
+            names,
+            [
+                ("a".to_string(), "file".to_string()),
+                ("b".into(), "captured".into()),
+                ("baseUrl".into(), "spec servers[0]".into()),
+                ("c".into(), "env".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn substitute_recursive_and_missing() {
+        let c = Ctx { env: map(&[("host", "{{scheme}}://x"), ("scheme", "https"), ("self", "{{self}}")]), ..Ctx::default() };
+        assert_eq!(c.substitute("{{ host }}/a").unwrap(), "https://x/a");
+        assert_eq!(c.substitute("no vars {{").unwrap(), "no vars {{");
+        assert_eq!(c.substitute("{{nope}} {{nope}} {{other}}").unwrap_err(), ["nope", "other"]);
+        // Self-reference stops at the depth limit instead of recursing forever.
+        assert_eq!(c.substitute("{{self}}").unwrap(), "{{self}}");
+    }
+
+    #[test]
+    fn dynamic_vars() {
+        let c = Ctx::default();
+        let uuid = c.substitute("{{$uuid}}").unwrap();
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('4'));
+        assert!(matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')));
+        assert!(uuid.chars().all(|ch| ch == '-' || ch.is_ascii_hexdigit()));
+        assert!(c.substitute("{{$timestamp}}").unwrap().parse::<u64>().unwrap() > 1_700_000_000);
+        assert!(c.substitute("{{$randomInt}}").unwrap().parse::<u64>().unwrap() < 1000);
+        assert_eq!(c.substitute("{{$env.OPENAPI_LSP_TEST_SURELY_UNSET}}").unwrap_err(), ["$env.OPENAPI_LSP_TEST_SURELY_UNSET"]);
+        let home = std::env::var("PATH").unwrap();
+        assert_eq!(c.substitute("{{$env.PATH}}").unwrap(), home);
+        assert_eq!(c.substitute("{{$processEnv PATH}}").unwrap(), home);
+        assert!(c.substitute("{{$bogus}}").is_err());
+    }
+
+    #[test]
+    fn var_names_with_spans() {
+        assert_eq!(
+            var_names_in("a {{ x }} b {{y}} {{open"),
+            [("x".to_string(), 2, 9), ("y".to_string(), 12, 17)]
+        );
+    }
+
+    #[test]
+    fn json_paths() {
+        let v = json!({"data": {"items": [{"id": 1}, {"id": 2}]}});
+        assert_eq!(json_path(&v, "data.items.1.id"), Some(&json!(2)));
+        assert_eq!(json_path(&v, "$.data.items.0.id"), Some(&json!(1)));
+        assert_eq!(json_path(&v, "$"), Some(&v));
+        assert_eq!(json_path(&v, "data.items.x"), None);
+        assert_eq!(json_path(&v, "data.missing"), None);
+    }
+
+    #[test]
+    fn load_env_picks_wanted_dev_or_first() {
+        let vars = json!({"a": "global", "n": 1}).as_object().unwrap().clone();
+        let envs = json!({"prod": {"a": "prod"}, "dev": {"a": "dev", "b": true}}).as_object().unwrap().clone();
+        let (name, m) = load_env(None, &vars, &envs);
+        assert_eq!(name, "dev");
+        assert_eq!(m, map(&[("a", "dev"), ("b", "true"), ("n", "1")]));
+        let (name, m) = load_env(Some("prod"), &vars, &envs);
+        assert_eq!((name.as_str(), m["a"].as_str()), ("prod", "prod"));
+        let only = json!({"stage": {}}).as_object().unwrap().clone();
+        assert_eq!(load_env(None, &vars, &only).0, "stage");
+        assert_eq!(load_env(None, &vars, &Map::new()).0, "default");
+    }
+
+    #[test]
+    fn captured_state_is_per_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(load_captured(root, "dev").is_empty());
+        save_captured(root, "dev", &[("token".into(), "1".into())]).unwrap();
+        save_captured(root, "dev", &[("user".into(), "u".into())]).unwrap();
+        save_captured(root, "prod", &[("token".into(), "2".into())]).unwrap();
+        assert_eq!(load_captured(root, "dev"), map(&[("token", "1"), ("user", "u")]));
+        assert_eq!(load_captured(root, "prod"), map(&[("token", "2")]));
+        assert_eq!(std::fs::read_to_string(root.join(".openapi/.gitignore")).unwrap(), "*\n");
+    }
+
+    #[test]
+    fn selected_env_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(load_selected(root), None);
+        save_selected(root, Some("prod")).unwrap();
+        assert_eq!(load_selected(root).as_deref(), Some("prod"));
+        save_selected(root, None).unwrap();
+        assert_eq!(load_selected(root), None);
+        save_selected(root, None).unwrap();
+        std::fs::write(root.join(SELECTED_ENV_FILE), "  \n").unwrap();
+        assert_eq!(load_selected(root), None);
+    }
+}

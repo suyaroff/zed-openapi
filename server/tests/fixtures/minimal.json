@@ -1,0 +1,30 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Minimal", "version": "1" },
+  "servers": [{ "url": "http://localhost:8080" }],
+  "paths": {
+    "/": {
+      "get": { "responses": { "200": { "description": "root" } } }
+    },
+    "/items": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "note": { "type": ["string", "null"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,6 +12,9 @@ mod runner;
 mod spec;
 mod util;
 
+#[cfg(test)]
+mod test_util;
+
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{

@@ -215,3 +215,125 @@ pub fn run_all(exprs: &[String], o: &Observed) -> Vec<(String, Option<String>)> 
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn obs<'a>(json: Option<&'a Value>, text: &'a str, headers: &'a [(String, String)]) -> Observed<'a> {
+        Observed { status: 201, elapsed_ms: 120, headers, json, text }
+    }
+
+    fn check(expr: &str, o: &Observed) -> Result<(), String> {
+        parse(expr)?.check(o)
+    }
+
+    #[test]
+    fn parses_subjects_and_ops() {
+        let p = |s: &str| {
+            let e = parse(s).unwrap();
+            (e.subject, e.op, e.value)
+        };
+        assert_eq!(p("status 200"), (Subject::Status, Op::Eq, "200".into()));
+        assert_eq!(p("status != 500"), (Subject::Status, Op::Ne, "500".into()));
+        assert_eq!(p("time <= 500"), (Subject::Time, Op::Le, "500".into()));
+        assert_eq!(p("header Content-Type contains json"), (Subject::Header("Content-Type".into()), Op::Contains, "json".into()));
+        assert_eq!(p("header X-Id"), (Subject::Header("X-Id".into()), Op::Exists, String::new()));
+        assert_eq!(p("data.id"), (Subject::Body("data.id".into()), Op::Exists, String::new()));
+        assert_eq!(p("data.id not exists"), (Subject::Body("data.id".into()), Op::NotExists, String::new()));
+        assert_eq!(p("data.id !exists"), (Subject::Body("data.id".into()), Op::NotExists, String::new()));
+        assert_eq!(p("data.role == \"admin\""), (Subject::Body("data.role".into()), Op::Eq, "\"admin\"".into()));
+        assert_eq!(p("body contains ok"), (Subject::Body(String::new()), Op::Contains, "ok".into()));
+    }
+
+    #[test]
+    fn parse_errors() {
+        assert!(parse("header").unwrap_err().contains("needs a name"));
+        assert!(parse("status").unwrap_err().contains("missing comparison"));
+        assert!(parse("time").unwrap_err().contains("missing comparison"));
+        assert!(parse("time ~ 5").unwrap_err().contains("unknown operator"));
+        assert!(parse("data.id ==").unwrap_err().contains("missing value"));
+        assert!(parse("data.id exists 1").unwrap_err().contains("unexpected `1`"));
+        assert!(parse("data.items containsx 1").unwrap_err().contains("unknown operator"));
+    }
+
+    #[test]
+    fn status_and_time() {
+        let o = obs(None, "", &[]);
+        assert!(check("status 201", &o).is_ok());
+        assert!(check("status 2xx", &o).is_ok());
+        assert!(check("status == 2XX", &o).is_ok());
+        assert!(check("status != 4xx", &o).is_ok());
+        assert_eq!(check("status 200", &o).unwrap_err(), "got 201");
+        assert!(check("status >= 200", &o).is_ok());
+        assert!(check("time < 500", &o).is_ok());
+        assert_eq!(check("time < 100", &o).unwrap_err(), "got 120");
+        assert!(check("time > fast", &o).unwrap_err().starts_with("not a number"));
+    }
+
+    #[test]
+    fn headers_are_case_insensitive() {
+        let h = [("content-type".to_string(), "application/json; charset=utf-8".to_string())];
+        let o = obs(None, "", &h);
+        assert!(check("header Content-Type contains json", &o).is_ok());
+        assert!(check("header CONTENT-TYPE", &o).is_ok());
+        assert_eq!(check("header X-Missing", &o).unwrap_err(), "missing");
+        assert!(check("header X-Missing !exists", &o).is_ok());
+        assert!(check("header Content-Type !exists", &o).is_err());
+    }
+
+    #[test]
+    fn json_body_paths() {
+        let v = json!({"data": {"id": 7, "role": "admin", "items": [1, 2, 3], "name": "Ann", "tags": ["a"], "meta": {"k": 1}, "s": "10"}});
+        let o = obs(Some(&v), "", &[]);
+        for ok in [
+            "data.id exists",
+            "data.nope !exists",
+            "data.id == 7",
+            "data.id == \"7\"",
+            "data.role == admin",
+            "data.role == \"admin\"",
+            "data.role != user",
+            "data.items.length > 0",
+            "data.items.length == 3",
+            "data.name.length == 3",
+            "data.meta.length == 1",
+            "data.items contains 2",
+            "data.tags contains \"a\"",
+            "data.meta contains k",
+            "data.role contains adm",
+            "data.s > 9",
+            "data.items.1 == 2",
+        ] {
+            assert!(check(ok, &o).is_ok(), "{ok}: {:?}", check(ok, &o));
+        }
+        assert_eq!(check("data.id == 8", &o).unwrap_err(), "got 7");
+        assert_eq!(check("data.nope exists", &o).unwrap_err(), "missing");
+        assert_eq!(check("data.id.length > 0", &o).unwrap_err(), "missing");
+        assert!(check("data.role > 1", &o).unwrap_err().starts_with("not a number"));
+    }
+
+    #[test]
+    fn whole_body() {
+        let v = json!({"ok": true});
+        let o = obs(Some(&v), r#"{"ok": true}"#, &[]);
+        assert!(check("body contains \"ok\": true", &o).is_ok());
+        assert!(check("body exists", &o).is_ok());
+        let o = obs(None, "plain text", &[]);
+        assert!(check("body contains plain", &o).is_ok());
+        assert!(check("body == plain text", &o).is_ok());
+        assert_eq!(check("data.x exists", &o).unwrap_err(), "missing");
+    }
+
+    #[test]
+    fn run_all_keeps_order() {
+        let o = obs(None, "", &[]);
+        let exprs = vec!["status 201".to_string(), "status 500".to_string(), "bogus ~".to_string()];
+        let r = run_all(&exprs, &o);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], ("status 201".to_string(), None));
+        assert_eq!(r[1].1.as_deref(), Some("got 201"));
+        assert!(r[2].1.as_deref().unwrap().contains("unknown operator"));
+    }
+}

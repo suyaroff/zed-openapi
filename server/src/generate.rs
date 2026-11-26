@@ -71,3 +71,56 @@ pub fn blocks(spec: &Spec, ops: &[&Op], file: &HttpFile) -> String {
     }
     out.join("\n\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_parser::parse;
+    use crate::test_util::spec;
+
+    fn groups(text: &str) -> Vec<(String, Vec<String>)> {
+        let s = spec();
+        missing_by_tag(&s, &parse(text))
+            .into_iter()
+            .map(|(t, ops)| (t, ops.iter().map(|o| format!("{} {}", o.method, o.path)).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn groups_missing_ops_by_tag_order() {
+        let g = groups("GET {{baseUrl}}/pets?limit=1\n\n###\nDELETE {{baseUrl}}/pets/{{id}}\n\n###\nGET {{baseUrl}}/owners/1\n");
+        assert_eq!(
+            g,
+            [
+                (
+                    "pets".to_string(),
+                    vec!["POST /pets".to_string(), "GET /pets/{id}".into(), "GET /pets/{id}/photos".into(), "GET /pets/mine/photos".into()]
+                ),
+                (UNTAGGED.to_string(), vec!["POST /login".to_string(), "GET /health".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_missing() {
+        let all: String = spec().ops.iter().map(|o| format!("{} {}\n\n###\n", o.method, o.path)).collect();
+        assert!(groups(&all).is_empty());
+    }
+
+    #[test]
+    fn blocks_name_requests_uniquely() {
+        let s = spec();
+        let file = parse("# @name getPet\nGET /pets/1\n");
+        let ops: Vec<&Op> = ["GET /pets/{id}", "DELETE /pets/{id}", "GET /health"]
+            .iter()
+            .map(|l| s.ops.iter().find(|o| format!("{} {}", o.method, o.path) == *l).unwrap())
+            .collect();
+        assert_eq!(
+            blocks(&s, &ops, &file),
+            "### Get pet\nGET {{baseUrl}}/pets/{{id}}\n\n\
+             ### DELETE /pets/{id}\n# @name delete_pet_\nDELETE {{baseUrl}}/pets/{{id}}\n\n\
+             ### Health\nGET {{baseUrl}}/health"
+        );
+        assert_eq!(request_name("a.b c-d_é"), "a_b_c-d_é");
+    }
+}

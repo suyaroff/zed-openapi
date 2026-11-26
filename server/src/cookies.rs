@@ -225,3 +225,121 @@ fn parse_http_date(s: &str) -> Option<u64> {
     let days = era * 146_097 + doe - 719_468;
     u64::try_from(days).ok().map(|days| days * 86400 + hh * 3600 + mm * 60 + ss)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jar(url: &str, set: &[&str]) -> Jar {
+        let mut j = Jar::default();
+        for s in set {
+            j.store(url, s);
+        }
+        j
+    }
+
+    #[test]
+    fn host_only_and_default_path() {
+        let j = jar("http://a.example.com/x/y", &["sid=1"]);
+        assert!(j.changed);
+        assert_eq!(j.header_for("http://a.example.com/x/z").as_deref(), Some("sid=1"));
+        assert_eq!(j.header_for("http://a.example.com/x").as_deref(), Some("sid=1"));
+        assert_eq!(j.header_for("http://a.example.com/xy"), None);
+        assert_eq!(j.header_for("http://a.example.com/"), None);
+        assert_eq!(j.header_for("http://b.a.example.com/x/z"), None);
+    }
+
+    #[test]
+    fn domain_cookies_cover_subdomains() {
+        let j = jar("http://a.example.com/", &["d=1; Domain=.Example.com; Path=/"]);
+        assert_eq!(j.header_for("http://example.com/").as_deref(), Some("d=1"));
+        assert_eq!(j.header_for("http://b.example.com/q").as_deref(), Some("d=1"));
+        assert_eq!(j.header_for("http://badexample.com/"), None);
+        let j = jar("http://a.example.com/", &["d=1; Domain=other.com"]);
+        assert_eq!(j.len(), 0);
+    }
+
+    #[test]
+    fn secure_only_over_https() {
+        let j = jar("https://h/", &["s=1; Secure; Path=/"]);
+        assert_eq!(j.header_for("https://h/a").as_deref(), Some("s=1"));
+        assert_eq!(j.header_for("http://h/a"), None);
+    }
+
+    #[test]
+    fn longer_paths_first() {
+        let j = jar("http://h/", &["a=1; Path=/", "b=2; Path=/x/"]);
+        assert_eq!(j.header_for("http://h/x/y").as_deref(), Some("b=2; a=1"));
+        assert_eq!(j.header_for("http://h/z").as_deref(), Some("a=1"));
+    }
+
+    #[test]
+    fn replace_and_expire() {
+        let mut j = jar("http://h/", &["a=1; Path=/", "a=2; Path=/"]);
+        assert_eq!(j.header_for("http://h/").as_deref(), Some("a=2"));
+        j.store("http://h/", "a=; Max-Age=0; Path=/");
+        assert_eq!(j.len(), 0);
+        j.store("http://h/", "b=1; Path=/");
+        j.store("http://h/", "b=1; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(j.len(), 0);
+        j.store("http://h/", "c=1; Path=/; Max-Age=3600");
+        assert_eq!(j.header_for("http://h/").as_deref(), Some("c=1"));
+        j.store("http://h/", "=x");
+        j.store("http://h/", "novalue");
+        assert_eq!(j.len(), 1);
+    }
+
+    #[test]
+    fn http_dates() {
+        assert_eq!(parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));
+        assert_eq!(parse_http_date("Sun, 06-Nov-94 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date("garbage"), None);
+        assert_eq!(parse_http_date("21 Oct 2015"), None);
+    }
+
+    #[test]
+    fn url_parts() {
+        assert_eq!(parts("https://user:pw@Host.COM:8443/p?q#f"), (true, "host.com".into(), "/p".into()));
+        assert_eq!(parts("http://[::1]:80"), (false, "[::1]".into(), "/".into()));
+        assert_eq!(parts("x.com/a"), (false, "x.com".into(), "/a".into()));
+    }
+
+    #[test]
+    fn save_replays_onto_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut a = Jar::load(root, "dev");
+        let mut b = Jar::load(root, "dev");
+        a.store("http://h/", "a=1; Path=/");
+        b.store("http://h/", "b=2; Path=/");
+        a.save(root, "dev").unwrap();
+        b.save(root, "dev").unwrap();
+        let j = Jar::load(root, "dev");
+        assert_eq!(j.len(), 2);
+        assert!(!j.changed);
+        assert_eq!(Jar::load(root, "prod").len(), 0);
+
+        Jar::clear(root, "dev").unwrap();
+        assert_eq!(Jar::load(root, "dev").len(), 0);
+    }
+
+    #[test]
+    fn load_drops_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = Cookie {
+            name: "old".into(),
+            value: "1".into(),
+            domain: "h".into(),
+            host_only: true,
+            path: "/".into(),
+            secure: false,
+            expires: Some(1),
+        };
+        let fresh = Cookie { name: "fresh".into(), expires: None, ..old.clone() };
+        write(root, "dev", &[old, fresh]).unwrap();
+        let j = Jar::load(root, "dev");
+        assert_eq!(j.header_for("http://h/").as_deref(), Some("fresh=1"));
+    }
+}

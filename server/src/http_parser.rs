@@ -333,3 +333,141 @@ fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) ->
         opts,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_blocks_and_collects_vars() {
+        let f = parse(
+            "@host = http://x\n\n\nGET {{host}}/a\n\n### second\nPOST {{host}}/b\nContent-Type: application/json\n\n{\"a\": 1}\n",
+        );
+        assert_eq!(f.vars.len(), 1);
+        assert_eq!((f.vars[0].name.as_str(), f.vars[0].value.as_str()), ("host", "http://x"));
+        assert_eq!(f.requests.len(), 2);
+        let (a, b) = (&f.requests[0], &f.requests[1]);
+        assert_eq!((a.method.as_str(), a.url.as_str(), a.line), ("GET", "{{host}}/a", 3));
+        assert_eq!((a.block_start, a.end_line), (0, 4));
+        assert_eq!((b.block_start, b.line, b.end_line), (5, 6, 10));
+        assert_eq!(b.header("content-type"), Some("application/json"));
+        assert_eq!(b.headers[0].line, 7);
+        assert_eq!(b.headers_end, 8);
+        let body = b.body.as_ref().unwrap();
+        assert_eq!((body.text.as_str(), body.start_line), ("{\"a\": 1}", 9));
+    }
+
+    #[test]
+    fn parse_var_rejects_bad_names() {
+        assert!(parse_var("@a b = 1").is_none());
+        assert!(parse_var("@ = 1").is_none());
+        assert!(parse_var("@a").is_none());
+        assert_eq!(parse_var("@a=x = y").unwrap().value, "x = y");
+    }
+
+    #[test]
+    fn request_line_parts() {
+        assert_eq!(parse_request_line("  POST /a?b=1 HTTP/1.1"), ("POST".into(), true, "/a?b=1".into(), 7, 13));
+        assert_eq!(parse_request_line("/a"), ("GET".into(), false, "/a".into(), 0, 2));
+        assert_eq!(parse_request_line("get /a").0, "GET");
+        assert!(!parse_request_line("get /a").1);
+    }
+
+    #[test]
+    fn directives() {
+        let f = parse(
+            "# @name login\n// @capture token = data.token\n# @capture  bad\n# @timeout 500ms\n# @no-redirect\n# @insecure\n# @no-auth\n# @no-cookie-jar\n# @expect status 200\n# @expect\n# @unknown x\nPOST /login\n",
+        );
+        let r = &f.requests[0];
+        assert_eq!(r.name.as_deref(), Some("login"));
+        assert_eq!(r.captures, vec![("token".to_string(), "data.token".to_string())]);
+        let o = &r.opts;
+        assert_eq!(o.timeout, Some(Duration::from_millis(500)));
+        assert!(o.no_redirect && o.insecure && o.no_auth && o.no_cookie_jar);
+        assert_eq!(o.expects, vec![(8, "status 200".to_string())]);
+        assert_eq!(r.key(), "@login");
+        assert!(f.named("login").is_some());
+        assert!(f.named("other").is_none());
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("3s"), Some(Duration::from_secs(3)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration(" 5 ms "), Some(Duration::from_millis(5)));
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("1h"), None);
+        assert_eq!(parse_duration("fast"), None);
+    }
+
+    #[test]
+    fn spec_directive_is_file_level() {
+        let f = parse("# @spec ./api.yaml\nGET /a\n");
+        assert_eq!(f.spec.as_deref(), Some("./api.yaml"));
+    }
+
+    #[test]
+    fn auth_defaults_and_overrides() {
+        let f = parse(
+            "# @auth login\n\n###\n# @name login\nPOST /login\n\n###\nGET /me\n\n###\n# @no-auth\nGET /public\n\n###\n# @auth other\nGET /x\n",
+        );
+        assert_eq!(f.auth.as_deref(), Some("login"));
+        let by_url = |u: &str| f.requests.iter().find(|r| r.url == u).unwrap();
+        assert_eq!(f.auth_for(by_url("/login")), None);
+        assert_eq!(f.auth_for(by_url("/me")), Some("login"));
+        assert_eq!(f.auth_for(by_url("/public")), None);
+        assert_eq!(f.auth_for(by_url("/x")), Some("other"));
+    }
+
+    #[test]
+    fn response_files_have_no_requests() {
+        let f = parse("# GET http://x/a\nHTTP/1.1 200 OK\nContent-Type: application/json\n\n{}\n");
+        assert!(f.requests.is_empty());
+    }
+
+    #[test]
+    fn multiline_url_continuation() {
+        let f = parse("GET /pets\n    ?limit=1\n    &status=sold\nAccept: */*\n");
+        let r = &f.requests[0];
+        assert_eq!(r.url, "/pets?limit=1&status=sold");
+        assert_eq!((r.url_start, r.url_end), (4, 9));
+        assert_eq!(r.headers[0].line, 3);
+        // An unindented `?` line is not a continuation.
+        let f = parse("GET /pets\n?limit=1\n");
+        assert_eq!(f.requests[0].url, "/pets");
+    }
+
+    #[test]
+    fn headers_end_without_blank_line() {
+        let f = parse("POST /a\nX-A: 1\n<a>text</a>\n");
+        let r = &f.requests[0];
+        assert_eq!(r.headers.len(), 1);
+        assert_eq!(r.headers_end, 2);
+        assert_eq!(r.body.as_ref().unwrap().start_line, 2);
+    }
+
+    #[test]
+    fn body_trims_trailing_blank_and_handler_lines() {
+        let f = parse("POST /a\n\nhello\n\n> {% client.test() %}\n\n");
+        assert_eq!(f.requests[0].body.as_ref().unwrap().text, "hello");
+        let f = parse("POST /a\n\n\n\n");
+        assert!(f.requests[0].body.is_none());
+    }
+
+    #[test]
+    fn comments_between_headers_are_skipped() {
+        let f = parse("GET /a\n# note\nX-A: 1\n// note\nX-B: 2\n");
+        let names: Vec<&str> = f.requests[0].headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["X-A", "X-B"]);
+    }
+
+    #[test]
+    fn request_lookup_by_line() {
+        let f = parse("GET /a\n\n###\nGET /b\n");
+        assert_eq!(f.request_at(1).unwrap().url, "/a");
+        assert_eq!(f.request_at(2).unwrap().url, "/b");
+        assert_eq!(f.request_at(3).unwrap().key(), "GET /b");
+        assert!(is_comment("// x") && is_comment("# x") && !is_comment("x"));
+    }
+}
