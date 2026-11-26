@@ -340,11 +340,7 @@ pub fn run(
     let resp = execute(p, opts)?;
     let elapsed = started.elapsed();
 
-    std::fs::create_dir_all(responses_dir).map_err(|e| e.to_string())?;
-    let ignore = responses_dir.join(".gitignore");
-    if !ignore.exists() {
-        let _ = std::fs::write(ignore, "*\n");
-    }
+    ensure_responses_dir(responses_dir)?;
     let ct = resp
         .headers
         .iter()
@@ -401,6 +397,8 @@ pub fn run(
     if !missed.is_empty() {
         let _ = writeln!(out, "# not captured: {}", missed.join(", "));
     }
+    out.push_str("#\n");
+    out.push_str(&format_request(p));
 
     let version = resp.version.replace("HTTP_", "HTTP/").replace('_', ".");
     let _ = writeln!(out, "{version} {} {}", resp.status, resp.reason);
@@ -430,6 +428,56 @@ pub fn run(
         response_path,
         captured,
     })
+}
+
+fn ensure_responses_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        let _ = std::fs::write(ignore, "*\n");
+    }
+    Ok(())
+}
+
+const BODY_PREVIEW_LIMIT: usize = 64 * 1024;
+
+/// Every line is a `# > ` comment, so the body can't introduce `###`, `@var` or `HTTP/`
+/// lines that would change how the response file is parsed.
+pub fn format_request(p: &Prepared) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# > {} {}", p.method, p.url);
+    for (k, v) in &p.headers {
+        let _ = writeln!(out, "# > {k}: {v}");
+    }
+    let Some(body) = p.body.as_deref().filter(|b| !b.is_empty()) else {
+        return out;
+    };
+    out.push_str("# >\n");
+    let Ok(text) = std::str::from_utf8(body) else {
+        let _ = writeln!(out, "# > (binary body, {})", human_size(body.len()));
+        return out;
+    };
+    let mut cut = text.len().min(BODY_PREVIEW_LIMIT);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    for line in text[..cut].lines() {
+        let _ = writeln!(out, "# > {line}");
+    }
+    if cut < text.len() {
+        let _ = writeln!(out, "# > … ({} more)", human_size(text.len() - cut));
+    }
+    out
+}
+
+pub fn write_preview(p: &Prepared, responses_dir: &Path, env_name: &str) -> Result<PathBuf, String> {
+    ensure_responses_dir(responses_dir)?;
+    let mut out = String::new();
+    let _ = writeln!(out, "# preview (not sent) · env {env_name} · {}", now_string());
+    out.push_str(&format_request(p));
+    let path = responses_dir.join(format!("{}.preview.http", p.stem));
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 fn human_size(n: usize) -> String {

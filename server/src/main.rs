@@ -34,6 +34,15 @@ use crate::util::{lsp_to_byte, path_to_uri, split_lines, uri_to_path};
 
 const CMD_SEND: &str = "openapi.send";
 const CMD_OPEN: &str = "openapi.openResponse";
+const CMD_PREVIEW: &str = "openapi.preview";
+
+struct PreparedAt {
+    prepared: runner::Prepared,
+    opts: runner::RunOptions,
+    root: PathBuf,
+    env_name: String,
+    key: String,
+}
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -370,6 +379,15 @@ impl Server {
             }),
             ..Default::default()
         })];
+        out.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Preview request".into(),
+            command: Some(Command {
+                title: "Preview request".into(),
+                command: CMD_PREVIEW.into(),
+                arguments: Some(vec![json!(uri.as_str()), json!(req.line)]),
+            }),
+            ..Default::default()
+        }));
         if let Some(path) = self
             .runs
             .lock()
@@ -390,14 +408,14 @@ impl Server {
         out
     }
 
-    fn open_document(&self, path: &Path) {
+    fn open_document(&self, path: &Path, take_focus: bool) {
         let id = request::<ShowDocument>(
             &self.sender,
             &self.next_id,
             ShowDocumentParams {
                 uri: path_to_uri(path),
                 external: Some(false),
-                take_focus: Some(self.settings.focus_response),
+                take_focus: Some(take_focus),
                 selection: None,
             },
         );
@@ -408,28 +426,30 @@ impl Server {
         match p.command.as_str() {
             CMD_OPEN => {
                 if let Some(path) = p.arguments.first().and_then(Value::as_str) {
-                    self.open_document(Path::new(path));
+                    self.open_document(Path::new(path), self.settings.focus_response);
                 }
             }
-            CMD_SEND => {
+            CMD_SEND | CMD_PREVIEW => {
                 let uri = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok());
                 let line = p.arguments.get(1).and_then(Value::as_u64).map(|l| l as usize);
                 if let (Some(uri), Some(line)) = (uri, line) {
-                    self.send(uri, line);
+                    if p.command == CMD_SEND {
+                        self.send(uri, line);
+                    } else {
+                        self.preview(uri, line);
+                    }
                 }
             }
             other => log(&self.sender, format!("unknown command {other}")),
         }
     }
 
-    fn send(&mut self, uri: Uri, line: usize) {
-        let Some((_, file, spec)) = self.load(&uri) else { return };
-        let Some(req) = file.requests.iter().find(|r| r.line == line).or_else(|| file.request_at(line)) else {
-            return;
-        };
-        let ctx = self.ctx_for(&uri, &file, spec.as_deref());
-        let root = self.root_for(&uri);
-        let base_dir = uri_to_path(&uri)
+    fn prepare_at(&mut self, uri: &Uri, line: usize) -> Option<PreparedAt> {
+        let (_, file, spec) = self.load(uri)?;
+        let req = file.requests.iter().find(|r| r.line == line).or_else(|| file.request_at(line))?;
+        let ctx = self.ctx_for(uri, &file, spec.as_deref());
+        let root = self.root_for(uri);
+        let base_dir = uri_to_path(uri)
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| root.clone());
         let opts = runner::RunOptions {
@@ -437,14 +457,29 @@ impl Server {
             default_accept: self.settings.default_accept.clone(),
             insecure: self.settings.insecure,
         };
-        let key = (uri.clone(), req.key());
-        let prepared = match runner::prepare(req, &ctx, spec.as_deref(), &base_dir, &opts) {
-            Ok(p) => p,
+        match runner::prepare(req, &ctx, spec.as_deref(), &base_dir, &opts) {
+            Ok(prepared) => Some(PreparedAt { prepared, opts, root, env_name: ctx.env_name, key: req.key() }),
             Err(e) => {
                 show(&self.sender, MessageType::ERROR, format!("Request not sent: {e}"));
-                return;
+                None
             }
+        }
+    }
+
+    fn preview(&mut self, uri: Uri, line: usize) {
+        let Some(p) = self.prepare_at(&uri, line) else { return };
+        let dir = p.root.join(&self.settings.responses_dir);
+        match runner::write_preview(&p.prepared, &dir, &p.env_name) {
+            Ok(path) => self.open_document(&path, true),
+            Err(e) => show(&self.sender, MessageType::ERROR, format!("Preview failed: {e}")),
+        }
+    }
+
+    fn send(&mut self, uri: Uri, line: usize) {
+        let Some(PreparedAt { prepared, opts, root, env_name, key }) = self.prepare_at(&uri, line) else {
+            return;
         };
+        let key = (uri, key);
 
         self.runs.lock().unwrap().insert(key.clone(), LastRun { title: "⏳ sending…".into(), path: None });
         request::<CodeLensRefresh>(&self.sender, &self.next_id, ());
@@ -455,7 +490,6 @@ impl Server {
         let pending = self.pending_show.clone();
         let next_id = self.next_id.clone();
         let focus = self.settings.focus_response;
-        let env_name = ctx.env_name.clone();
         std::thread::spawn(move || {
             log(&sender, format!("{} {}", prepared.method, prepared.url));
             let run = match runner::run(&prepared, &opts, &responses_dir, &root, &env_name) {
@@ -655,7 +689,7 @@ fn main() -> anyhow::Result<()> {
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![CMD_SEND.into(), CMD_OPEN.into()],
+            commands: vec![CMD_SEND.into(), CMD_OPEN.into(), CMD_PREVIEW.into()],
             ..Default::default()
         }),
         ..Default::default()
