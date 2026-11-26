@@ -961,12 +961,15 @@ impl Server {
 
         if let Some(name) = directive_arg(line, "auth").filter(|(_, s, e)| (*s..=*e).contains(&col)).map(|(n, ..)| n) {
             let job = self.find_named(&uri, &file, &name)?;
-            let target = if job.uri == uri { text.clone() } else { std::fs::read_to_string(uri_to_path(&job.uri)?).ok()? };
+            let target = match self.docs.get(&job.uri) {
+                Some(t) => t.clone(),
+                None => std::fs::read_to_string(uri_to_path(&job.uri)?).ok()?,
+            };
             let tl = split_lines(&target);
             let l = (job.req.block_start..=job.req.line)
-                .find(|&i| directive_arg(tl[i], "name").is_some_and(|(n, ..)| n == name))
+                .find(|&i| tl.get(i).and_then(|t| directive_arg(t, "name")).is_some_and(|(n, ..)| n == name))
                 .unwrap_or(job.req.line);
-            return Some(at(&job.uri, l, tl[l], &name));
+            return Some(at(&job.uri, l, tl.get(l)?, &name));
         }
 
         let (name, ..) = env::var_names_in(line).into_iter().find(|(_, s, e)| (*s..*e).contains(&col))?;
@@ -1331,7 +1334,7 @@ fn directive_arg(line: &str, directive: &str) -> Option<(String, usize, usize)> 
         return None;
     }
     let arg = rest.trim();
-    let start = line.find(arg)?;
+    let start = line.len() - rest.trim_start().len();
     (!arg.is_empty()).then(|| (arg.to_string(), start, start + arg.len()))
 }
 

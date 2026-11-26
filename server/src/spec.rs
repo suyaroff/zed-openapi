@@ -199,10 +199,13 @@ impl Spec {
             offset += s.len() + 1;
         }
         let is_var = |s: &str| s.starts_with("{{");
+        // Leading `{{baseUrl}}`-like segments are the prefix, never part of the path to fix.
+        let base = segs.iter().take_while(|(_, s)| is_var(s)).count();
+        let avail = segs.len() - base;
         let mut scored: Vec<(usize, bool, String, String)> = Vec::new();
         for op in &self.ops {
             let n = op.segs.len();
-            for k in n.saturating_sub(1).max(1)..=(n + 1).min(segs.len()) {
+            for k in n.saturating_sub(1).max(1)..=(n + 1).min(avail) {
                 let tail = &segs[segs.len() - k..];
                 if tail.iter().all(|(_, s)| is_var(s)) {
                     continue;

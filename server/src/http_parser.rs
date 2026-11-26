@@ -47,7 +47,7 @@ pub const DIRECTIVES: &[(&str, &str)] = &[
 fn parse_duration(v: &str) -> Option<Duration> {
     let v = v.trim();
     let split = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
-    let n: u64 = v[..split].parse().ok()?;
+    let n: u64 = v[..split].parse().ok().filter(|&n| n > 0)?;
     match v[split..].trim() {
         "" | "s" => Some(Duration::from_secs(n)),
         "ms" => Some(Duration::from_millis(n)),

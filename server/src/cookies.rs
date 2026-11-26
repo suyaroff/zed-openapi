@@ -5,9 +5,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FILE: &str = ".openapi/cookies.json";
+
+/// Serializes read-modify-write of the file across send threads.
+static LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Cookie {
@@ -25,6 +29,9 @@ struct Cookie {
 pub struct Jar {
     cookies: Vec<Cookie>,
     pub changed: bool,
+    /// (url, Set-Cookie) received since `load`, replayed onto the current file in `save`
+    /// so concurrent requests don't overwrite each other's cookies.
+    received: Vec<(String, String)>,
 }
 
 fn now() -> u64 {
@@ -71,26 +78,26 @@ impl Jar {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         let t = now();
-        Jar { cookies: cookies.into_iter().filter(|c| c.expires.is_none_or(|e| e > t)).collect(), changed: false }
+        Jar {
+            cookies: cookies.into_iter().filter(|c| c.expires.is_none_or(|e| e > t)).collect(),
+            ..Jar::default()
+        }
     }
 
     pub fn save(&self, root: &Path, env: &str) -> std::io::Result<()> {
-        let mut all = read_all(root);
-        if self.cookies.is_empty() {
-            all.remove(env);
-        } else {
-            all.insert(env.to_string(), serde_json::to_value(&self.cookies).unwrap_or_default());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current = Jar::load(root, env);
+        for (url, set_cookie) in &self.received {
+            current.store(url, set_cookie);
         }
-        let path = root.join(FILE);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(&Value::Object(all))?)
+        write(root, env, &current.cookies)
     }
 
     pub fn clear(root: &Path, env: &str) -> std::io::Result<()> {
-        Jar::default().save(root, env)
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        write(root, env, &[])
     }
+
 
     pub fn len(&self) -> usize {
         self.cookies.len()
@@ -116,6 +123,7 @@ impl Jar {
     }
 
     pub fn store(&mut self, url: &str, set_cookie: &str) {
+        self.received.push((url.to_string(), set_cookie.to_string()));
         let (_, host, req_path) = parts(url);
         let mut attrs = set_cookie.split(';');
         let Some((name, value)) = attrs.next().and_then(|nv| nv.split_once('=')) else { return };
@@ -169,6 +177,20 @@ impl Jar {
     }
 }
 
+fn write(root: &Path, env: &str, cookies: &[Cookie]) -> std::io::Result<()> {
+    let mut all = read_all(root);
+    if cookies.is_empty() {
+        all.remove(env);
+    } else {
+        all.insert(env.to_string(), serde_json::to_value(cookies).unwrap_or_default());
+    }
+    let path = root.join(FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&Value::Object(all))?)
+}
+
 /// `Wdy, DD Mon YYYY HH:MM:SS GMT` and the `DD-Mon-YY` variant, as Unix seconds.
 fn parse_http_date(s: &str) -> Option<u64> {
     const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -183,7 +205,7 @@ fn parse_http_date(s: &str) -> Option<u64> {
         } else if let Ok(n) = tok.parse::<i64>() {
             if day.is_none() && tok.len() <= 2 {
                 day = Some(n);
-            } else {
+            } else if year.is_none() && !tok.starts_with('+') {
                 year = Some(match n {
                     0..=69 => n + 2000,
                     70..=99 => n + 1900,

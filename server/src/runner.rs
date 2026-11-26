@@ -478,7 +478,9 @@ pub fn run(
     let response_path = responses_dir.join(format!("{}.http", p.stem));
     std::fs::write(&response_path, &out).map_err(|e| e.to_string())?;
     if opts.history > 0 {
-        save_history(responses_dir, &p.stem, &out, opts.history).map_err(|e| e.to_string())?;
+        if let Err(e) = save_history(responses_dir, &p.stem, &out, opts.history) {
+            eprintln!("openapi-lsp: history for {}: {e}", p.stem);
+        }
     }
     Ok(Outcome {
         status: resp.status,
@@ -612,7 +614,8 @@ pub fn write_curl(p: &Prepared, opts: &RunOptions, responses_dir: &Path) -> Resu
         args.push("-k".into());
     }
     if opts.follow_redirects {
-        // Same-host redirects keep POST and its body, as in `execute`.
+        // Keeps POST on same-host redirects like `execute`; curl can't limit it to the same host,
+        // so cross-host 301/302 also keep POST here, unlike `execute`.
         args.push("-L".into());
         if p.method == "POST" {
             args.extend(["--post301".into(), "--post302".into()]);

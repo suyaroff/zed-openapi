@@ -166,8 +166,10 @@ impl Expect {
             Op::Exists => true,
             Op::NotExists => false,
             Op::Eq | Op::Ne => {
-                let class = self.value.len() == 3 && self.value[1..].eq_ignore_ascii_case("xx");
-                let eq = if self.subject == Subject::Status && class {
+                let class = self.subject == Subject::Status
+                    && self.value.len() == 3
+                    && self.value.get(1..).is_some_and(|x| x.eq_ignore_ascii_case("xx"));
+                let eq = if class {
                     self.value[..1] == (o.status / 100).to_string()
                 } else {
                     equal(&actual, &self.value)

@@ -172,6 +172,24 @@ pub fn neutralize_vars(text: &str) -> String {
 }
 
 /// Pretty-prints a JSON body; unquoted `{{vars}}` survive as-is.
+/// JSON text without whitespace outside strings.
+fn strip_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            in_string = escaped || c != '"';
+            escaped = !escaped && c == '\\';
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            in_string = c == '"';
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn format_body(text: &str) -> Option<String> {
     let mut masked = String::with_capacity(text.len());
     let mut vars = Vec::new();
@@ -207,6 +225,11 @@ pub fn format_body(text: &str) -> Option<String> {
         masked.push(c);
     }
     let value: serde_json::Value = serde_json::from_str(&masked).ok()?;
+    // serde_json would round high-precision numbers and drop duplicate keys: format only
+    // when re-serializing reproduces the same tokens.
+    if serde_json::to_string(&value).ok()? != strip_ws(&masked) {
+        return None;
+    }
     let mut pretty = serde_json::to_string_pretty(&value).ok()?;
     for (n, v) in vars.iter().enumerate() {
         pretty = pretty.replace(&format!("\"__oapi_var_{n}__\""), v);
