@@ -7,7 +7,6 @@ pub struct KeyTok {
     pub parent: Vec<PathElem>,
     pub key: String,
     pub start: usize,
-    pub end: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,7 +95,6 @@ pub fn scan(text: &str, cursor: Option<usize>) -> (Vec<KeyTok>, Option<CursorCtx
                         parent: path_of(&frames[..frames.len() - 1]),
                         key: content.clone(),
                         start,
-                        end,
                     });
                     if let Some(top) = frames.last_mut() {
                         top.key = Some(content);
@@ -149,7 +147,8 @@ pub fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Replaces `{{...}}` placeholders so the body can be parsed as JSON.
+/// Replaces `{{...}}` placeholders so the body can be parsed as JSON. Length-preserving
+/// (`0` padded with spaces), so byte offsets stay valid for the original text.
 pub fn neutralize_vars(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -157,7 +156,9 @@ pub fn neutralize_vars(text: &str) -> String {
         out.push_str(&rest[..s]);
         match rest[s..].find("}}") {
             Some(e) => {
+                let len = rest[s..s + e + 2].len();
                 out.push('0');
+                out.extend(std::iter::repeat_n(' ', len - 1));
                 rest = &rest[s + e + 2..];
             }
             None => {
@@ -168,6 +169,49 @@ pub fn neutralize_vars(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Pretty-prints a JSON body; unquoted `{{vars}}` survive as-is.
+pub fn format_body(text: &str) -> Option<String> {
+    let mut masked = String::with_capacity(text.len());
+    let mut vars = Vec::new();
+    let mut in_string = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            masked.push(c);
+            match c {
+                '\\' => {
+                    if let Some((_, n)) = chars.next() {
+                        masked.push(n);
+                    }
+                }
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '{' && text[i..].starts_with("{{") {
+            if let Some(e) = text[i..].find("}}") {
+                masked.push_str(&format!("\"__oapi_var_{}__\"", vars.len()));
+                vars.push(&text[i..i + e + 2]);
+                for _ in 0..text[i..i + e + 2].chars().count() - 1 {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        if c == '"' {
+            in_string = true;
+        }
+        masked.push(c);
+    }
+    let value: serde_json::Value = serde_json::from_str(&masked).ok()?;
+    let mut pretty = serde_json::to_string_pretty(&value).ok()?;
+    for (n, v) in vars.iter().enumerate() {
+        pretty = pretty.replace(&format!("\"__oapi_var_{n}__\""), v);
+    }
+    Some(pretty)
 }
 
 /// Strict JSON tree with byte spans, for pointing diagnostics at exact keys and values.

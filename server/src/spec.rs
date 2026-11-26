@@ -182,6 +182,66 @@ impl Spec {
         }
     }
 
+    /// Up to 3 spec paths close to `url` (a request line URL): (new url, "METHOD /path").
+    /// The URL prefix (`{{baseUrl}}/api`, host) and the query are kept.
+    pub fn closest_paths(&self, method: &str, url: &str) -> Vec<(String, String)> {
+        let split = url.find(['?', '#']).unwrap_or(url.len());
+        let (path_part, rest) = url.split_at(split);
+        let path_start = path_part
+            .find("://")
+            .map_or(0, |i| path_part[i + 3..].find('/').map_or(path_part.len(), |j| i + 3 + j));
+        let mut segs: Vec<(usize, &str)> = Vec::new();
+        let mut offset = path_start;
+        for s in path_part[path_start..].split('/') {
+            if !s.is_empty() {
+                segs.push((offset, s));
+            }
+            offset += s.len() + 1;
+        }
+        let is_var = |s: &str| s.starts_with("{{");
+        let mut scored: Vec<(usize, bool, String, String)> = Vec::new();
+        for op in &self.ops {
+            let n = op.segs.len();
+            for k in n.saturating_sub(1).max(1)..=(n + 1).min(segs.len()) {
+                let tail = &segs[segs.len() - k..];
+                if tail.iter().all(|(_, s)| is_var(s)) {
+                    continue;
+                }
+                let score = seg_distance(&op.segs, tail.iter().map(|(_, s)| *s).collect::<Vec<_>>().as_slice());
+                let chars: usize = tail.iter().map(|(_, s)| s.chars().count()).sum();
+                if score == 0 || score > (chars * 2 / 5).max(2) {
+                    continue;
+                }
+                let new_path: Vec<String> = op
+                    .segs
+                    .iter()
+                    .zip(op.path.split('/').filter(|s| !s.is_empty()))
+                    .enumerate()
+                    .map(|(i, (seg, raw))| match seg {
+                        Seg::Lit(l) => l.clone(),
+                        Seg::Param if k == n => tail[i].1.to_string(),
+                        Seg::Param => format!("{{{{{}}}}}", raw.trim_matches(['{', '}'])),
+                    })
+                    .collect();
+                let prefix = &path_part[..tail[0].0.saturating_sub(1).max(path_start)];
+                let new_url = format!("{prefix}/{}{rest}", new_path.join("/"));
+                let same_method = op.method.eq_ignore_ascii_case(method);
+                scored.push((score, !same_method, new_url, format!("{} {}", op.method, op.path)));
+            }
+        }
+        scored.sort_by_key(|a| (a.0, a.1));
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, _, url, label) in scored {
+            if !out.iter().any(|(u, l)| *u == url || *l == label) {
+                out.push((url, label));
+            }
+            if out.len() == 3 {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn find_exact(&self, method: &str, url: &str) -> Option<&Op> {
         match self.find(method, url) {
             Match::Exact(op) => Some(op),
@@ -447,3 +507,46 @@ impl Spec {
         })
     }
 }
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Segment-level edit distance; a `{param}` matches any segment, `{{var}}` matches anything.
+fn seg_distance(op: &[Seg], req: &[&str]) -> usize {
+    let cost = |s: &Seg| match s {
+        Seg::Lit(l) => l.chars().count().max(1),
+        Seg::Param => 2,
+    };
+    let mut prev: Vec<usize> = std::iter::once(0)
+        .chain(req.iter().scan(0, |acc, r| {
+            *acc += r.chars().count().max(1);
+            Some(*acc)
+        }))
+        .collect();
+    for s in op {
+        let mut cur = vec![prev[0] + cost(s)];
+        for (j, r) in req.iter().enumerate() {
+            let sub = match s {
+                _ if r.starts_with("{{") => 0,
+                Seg::Param => 0,
+                Seg::Lit(l) => levenshtein(l, r),
+            };
+            let del = prev[j + 1] + cost(s);
+            let ins = cur[j] + r.chars().count().max(1);
+            cur.push((prev[j] + sub).min(del).min(ins));
+        }
+        prev = cur;
+    }
+    prev[req.len()]
+}
+

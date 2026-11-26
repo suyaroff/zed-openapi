@@ -43,6 +43,7 @@ const CMD_CURL: &str = "openapi.curl";
 const CMD_ENV: &str = "openapi.selectEnv";
 const CMD_CLEAR_COOKIES: &str = "openapi.clearCookies";
 const CMD_RUN_ALL: &str = "openapi.runAll";
+const CMD_OPEN_AT: &str = "openapi.openAt";
 const CMD_DIFF: &str = "openapi.diffResponse";
 /// `runs` key of the file-level Run all result.
 const RUN_ALL_KEY: &str = "\0run-all";
@@ -463,7 +464,8 @@ impl Server {
     fn publish(&mut self, uri: &Uri) {
         let Some((text, file, spec)) = self.load(uri) else { return };
         let ctx = self.ctx_for(uri, &file, spec.as_deref());
-        let mut diagnostics = diagnostics::compute(&text, &file, spec.as_deref(), &ctx);
+        let mut diagnostics: Vec<Diagnostic> =
+            diagnostics::compute(&text, &file, spec.as_deref(), &ctx).into_iter().map(|f| f.diag).collect();
         let lines = split_lines(&text);
         let runs = self.runs.lock().unwrap();
         for req in &file.requests {
@@ -647,7 +649,47 @@ impl Server {
             })
         };
         let mut out = Vec::new();
+        let ctx = self.ctx_for(&uri, &file, spec.as_deref());
+        let overlaps = |r: &Range| r.start <= p.range.end && p.range.start <= r.end;
+        for f in diagnostics::compute(&text, &file, spec.as_deref(), &ctx) {
+            if !overlaps(&f.diag.range) {
+                continue;
+            }
+            for fx in f.fixes {
+                out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: fx.title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![f.diag.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri.clone(), fx.edits)])),
+                        ..Default::default()
+                    }),
+                    is_preferred: fx.preferred.then_some(true),
+                    ..Default::default()
+                }));
+            }
+        }
         if let Some(req) = file.request_at(line) {
+            if let Some(body) = req.body.as_ref().filter(|b| b.text.trim_start().starts_with(['{', '['])) {
+                if let Some(pretty) = json_scan::format_body(&body.text).filter(|f| *f != body.text) {
+                    let lines = split_lines(&text);
+                    let last = body.start_line + body.text.split('\n').count() - 1;
+                    let end = util::range_on_line(&lines, last, lines[last].len(), lines[last].len()).end;
+                    let edit = TextEdit { range: Range::new(Position::new(body.start_line as u32, 0), end), new_text: pretty };
+                    out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Format JSON body".into(),
+                        kind: Some(CodeActionKind::SOURCE),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
+            if let Some((path, line, label)) = self.spec_location(&uri, &file, spec.as_deref(), req) {
+                out.push(cmd(format!("Open {label} in spec"), CMD_OPEN_AT, vec![json!(path.to_string_lossy()), json!(line)]));
+            }
             let at = vec![json!(uri.as_str()), json!(req.line)];
             out.push(cmd(format!("Send request: {} {}", req.method, req.url), CMD_SEND, at.clone()));
             out.push(cmd("Preview request".into(), CMD_PREVIEW, at.clone()));
@@ -682,6 +724,41 @@ impl Server {
             out.extend(self.generate_actions(&uri, &text, &file, spec));
         }
         out
+    }
+
+    /// Line of the matched operation (or its path item) in the spec file.
+    fn spec_location(
+        &mut self,
+        uri: &Uri,
+        file: &HttpFile,
+        spec: Option<&Spec>,
+        req: &http_parser::Request,
+    ) -> Option<(PathBuf, usize, String)> {
+        let spec = spec?;
+        let (op_path, method) = match spec.find(&req.method, &req.url) {
+            Match::Exact(op) => (op.path.clone(), Some(op.method.to_lowercase())),
+            Match::WrongMethod(ops) => (ops[0].path.clone(), None),
+            Match::None => return None,
+        };
+        let path = self.spec_path(uri, file)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let lines = split_lines(&text);
+        let is_key = |l: &str, key: &str| {
+            let t = l.trim_start();
+            [format!("\"{key}\""), format!("'{key}'"), key.to_string()]
+                .iter()
+                .any(|k| t.strip_prefix(k.as_str()).is_some_and(|r| r.trim_start().starts_with(':')))
+        };
+        let path_line = lines.iter().position(|l| is_key(l, &op_path)).unwrap_or(0);
+        let line = method
+            .as_deref()
+            .and_then(|m| (path_line + 1..lines.len()).find(|&i| is_key(lines[i], m)))
+            .unwrap_or(path_line);
+        let label = match &method {
+            Some(m) => format!("{} {op_path}", m.to_uppercase()),
+            None => op_path,
+        };
+        Some((path, line, label))
     }
 
     fn generate_actions(&self, uri: &Uri, text: &str, file: &HttpFile, spec: &Spec) -> Vec<CodeActionOrCommand> {
@@ -722,6 +799,10 @@ impl Server {
     }
 
     fn open_document(&self, path: &Path, take_focus: bool) {
+        self.open_document_at(path, take_focus, None);
+    }
+
+    fn open_document_at(&self, path: &Path, take_focus: bool, selection: Option<Range>) {
         let id = request::<ShowDocument>(
             &self.sender,
             &self.next_id,
@@ -729,7 +810,7 @@ impl Server {
                 uri: path_to_uri(path),
                 external: Some(false),
                 take_focus: Some(take_focus),
-                selection: None,
+                selection,
             },
         );
         self.pending_show.lock().unwrap().insert(id, path.to_path_buf());
@@ -740,6 +821,14 @@ impl Server {
             CMD_OPEN => {
                 if let Some(path) = p.arguments.first().and_then(Value::as_str) {
                     self.open_document(Path::new(path), self.settings.focus_response);
+                }
+            }
+            CMD_OPEN_AT => {
+                let path = p.arguments.first().and_then(Value::as_str);
+                let line = p.arguments.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
+                if let Some(path) = path {
+                    let at = Position::new(line, 0);
+                    self.open_document_at(Path::new(path), true, Some(Range::new(at, at)));
                 }
             }
             CMD_RUN_ALL => {
@@ -1306,7 +1395,7 @@ fn main() -> anyhow::Result<()> {
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV, CMD_CLEAR_COOKIES, CMD_RUN_ALL, CMD_DIFF].map(String::from).to_vec(),
+            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV, CMD_CLEAR_COOKIES, CMD_RUN_ALL, CMD_DIFF, CMD_OPEN_AT].map(String::from).to_vec(),
             ..Default::default()
         }),
         ..Default::default()
