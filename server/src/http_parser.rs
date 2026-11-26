@@ -27,12 +27,15 @@ pub struct Options {
     pub no_cookie_jar: bool,
     /// `# @auth login`: name of the request that refreshes the token.
     pub auth: Option<String>,
+    /// `# @expect …` lines: (line, expression).
+    pub expects: Vec<(usize, String)>,
 }
 
 pub const DIRECTIVES: &[(&str, &str)] = &[
     ("name", "request name: response file name and `@auth` target"),
     ("capture", "`var = json.path`: save a response field after a 2xx response"),
     ("spec", "OpenAPI spec for this file"),
+    ("expect", "assertion: `status 201`, `data.id exists`, `data.items.length > 0`, `time < 500`"),
     ("auth", "request that logs in: run first if its captures are empty, and again on 401"),
     ("no-auth", "don't add `Authorization` and don't run `@auth`"),
     ("timeout", "timeout for this request: `120`, `500ms`, `2m`"),
@@ -235,6 +238,7 @@ fn parse_block(lines: &[&str], start: usize, end: usize, file: &mut HttpFile) ->
                     "insecure" => opts.insecure = true,
                     "no-auth" => opts.no_auth = true,
                     "no-cookie-jar" => opts.no_cookie_jar = true,
+                    "expect" if !val.is_empty() => opts.expects.push((i, val.to_string())),
                     _ => {}
                 }
             }

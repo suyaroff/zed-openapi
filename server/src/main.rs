@@ -2,6 +2,7 @@ mod completion;
 mod cookies;
 mod diagnostics;
 mod env;
+mod expect;
 mod generate;
 mod http_parser;
 mod json_scan;
@@ -18,7 +19,7 @@ use lsp_types::notification::{
     DidSaveTextDocument, LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 };
 use lsp_types::request::{
-    CodeActionRequest, CodeLensRefresh, CodeLensRequest, Completion, ExecuteCommand, HoverRequest,
+    CodeActionRequest, CodeLensRefresh, CodeLensRequest, Completion, ExecuteCommand, GotoDefinition, HoverRequest,
     Request as _, ShowDocument, ShowMessageRequest, WorkspaceConfiguration,
 };
 use lsp_types::*;
@@ -41,6 +42,10 @@ const CMD_PREVIEW: &str = "openapi.preview";
 const CMD_CURL: &str = "openapi.curl";
 const CMD_ENV: &str = "openapi.selectEnv";
 const CMD_CLEAR_COOKIES: &str = "openapi.clearCookies";
+const CMD_RUN_ALL: &str = "openapi.runAll";
+const CMD_DIFF: &str = "openapi.diffResponse";
+/// `runs` key of the file-level Run all result.
+const RUN_ALL_KEY: &str = "\0run-all";
 
 /// Everything needed to prepare and send one request, so it can be (re)prepared off the main
 /// thread, e.g. after `@auth` captured a fresh token.
@@ -96,7 +101,11 @@ struct Bg {
     pending: Arc<Mutex<HashMap<RequestId, PathBuf>>>,
     next_id: Arc<AtomicU64>,
     focus: bool,
+    /// Open each response in the editor (off for Run all).
+    open: bool,
     responses_dir: String,
+    /// Asks the main loop to republish diagnostics for a document.
+    republish: Sender<Uri>,
 }
 
 impl Bg {
@@ -120,7 +129,7 @@ impl Bg {
             Ok(o) => o,
             Err(e) => {
                 let e = format!("{} {}: {e}", prepared.method, prepared.url);
-                self.set_lens(job.key(), LastRun { title: format!("✗ {}", util::one_line(&e, 60)), path: None });
+                self.set_lens(job.key(), LastRun::note(format!("✗ {}", util::one_line(&e, 60))));
                 return Err(e);
             }
         };
@@ -133,6 +142,15 @@ impl Bg {
             let names: Vec<&str> = o.captured.iter().map(|(k, _)| k.as_str()).collect();
             title.push_str(&format!(" · captured {}", names.join(", ")));
         }
+        if !o.checks.is_empty() {
+            let failed = o.checks.iter().filter(|(_, f)| f.is_some()).count();
+            if failed == 0 {
+                title.push_str(&format!(" · ✓ {} expect", o.checks.len()));
+            } else {
+                title = title.replacen('✓', "✗", 1);
+                title.push_str(&format!(" · ✗ {failed}/{} expect", o.checks.len()));
+            }
+        }
         let issues = job
             .spec
             .as_deref()
@@ -141,18 +159,22 @@ impl Bg {
         if issues > 0 {
             title.push_str(&format!(" · ⚠ {issues} spec"));
         }
-        let id = request::<ShowDocument>(
-            &self.sender,
-            &self.next_id,
-            ShowDocumentParams {
-                uri: path_to_uri(&o.response_path),
-                external: Some(false),
-                take_focus: Some(self.focus),
-                selection: None,
-            },
-        );
-        self.pending.lock().unwrap().insert(id, o.response_path.clone());
-        self.set_lens(job.key(), LastRun { title, path: Some(o.response_path.clone()) });
+        if self.open {
+            let id = request::<ShowDocument>(
+                &self.sender,
+                &self.next_id,
+                ShowDocumentParams {
+                    uri: path_to_uri(&o.response_path),
+                    external: Some(false),
+                    take_focus: Some(self.focus),
+                    selection: None,
+                },
+            );
+            self.pending.lock().unwrap().insert(id, o.response_path.clone());
+        }
+        let run = LastRun { title, path: Some(o.response_path.clone()), checks: o.checks.clone() };
+        self.set_lens(job.key(), run);
+        let _ = self.republish.send(job.uri.clone());
         Ok(o)
     }
 
@@ -168,11 +190,11 @@ impl Bg {
     }
 
     /// `@auth`: log in first when the login's captures are empty, and once more on 401.
-    fn send(&self, mut job: Job, login: Option<Job>) -> Result<(), String> {
+    fn send(&self, mut job: Job, login: Option<Job>) -> Result<runner::Outcome, String> {
         let name = login.as_ref().map(Job::label);
         let mut relogged = false;
         if let Some(login) = login.as_ref().filter(|l| job.missing_captures(l)) {
-            self.set_lens(job.key(), LastRun { title: format!("⏳ {}…", login.label()), path: None });
+            self.set_lens(job.key(), LastRun::note(format!("⏳ {}…", login.label())));
             self.login(login)?;
             job.reload_captured();
             relogged = true;
@@ -183,9 +205,9 @@ impl Bg {
             self.login(login)?;
             job.reload_captured();
             let note = format!("↻ {} after 401", login.label());
-            self.exec(&job, Some(&note))?;
+            return self.exec(&job, Some(&note));
         }
-        Ok(())
+        Ok(o)
     }
 }
 
@@ -202,6 +224,7 @@ struct Settings {
     focus_response: bool,
     insecure: bool,
     cookie_jar: bool,
+    history_size: usize,
 }
 
 impl Default for Settings {
@@ -217,6 +240,7 @@ impl Default for Settings {
             focus_response: false,
             insecure: false,
             cookie_jar: true,
+            history_size: 10,
         }
     }
 }
@@ -231,10 +255,18 @@ impl Settings {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct LastRun {
     title: String,
     path: Option<PathBuf>,
+    /// (expression, failure) per `@expect`, shown as diagnostics on the request.
+    checks: Vec<(String, Option<String>)>,
+}
+
+impl LastRun {
+    fn note(title: String) -> Self {
+        LastRun { title, ..Default::default() }
+    }
 }
 
 struct SpecEntry {
@@ -255,6 +287,7 @@ struct Server {
     /// `window/showMessageRequest` env pickers awaiting an answer, keyed to the project root.
     pending_env: HashMap<RequestId, PathBuf>,
     next_id: Arc<AtomicU64>,
+    republish: Sender<Uri>,
 }
 
 fn notify<N: lsp_types::notification::Notification>(sender: &Sender<Message>, params: N::Params) {
@@ -431,6 +464,27 @@ impl Server {
         let Some((text, file, spec)) = self.load(uri) else { return };
         let ctx = self.ctx_for(uri, &file, spec.as_deref());
         let mut diagnostics = diagnostics::compute(&text, &file, spec.as_deref(), &ctx);
+        let lines = split_lines(&text);
+        let runs = self.runs.lock().unwrap();
+        for req in &file.requests {
+            let Some(run) = runs.get(&(uri.clone(), req.key())) else { continue };
+            // Checks follow `@expect` order; expressions may differ after `{{var}}` substitution.
+            if run.checks.len() != req.opts.expects.len() {
+                continue;
+            }
+            for ((line, e), (shown, failure)) in req.opts.expects.iter().zip(&run.checks) {
+                if let Some(failure) = failure.as_ref().filter(|_| expect::parse(e).is_ok()) {
+                    diagnostics.push(Diagnostic {
+                        range: util::full_line(&lines, *line),
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        source: Some("openapi".into()),
+                        message: format!("expect failed: {shown} · {failure}"),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        drop(runs);
         if file.requests.is_empty() {
             if let Some(spec) = spec.as_deref() {
                 diagnostics.extend(response::diagnostics(&text, spec));
@@ -542,6 +596,21 @@ impl Server {
                     data: None,
                 });
             }
+            if i == 0 && file.requests.len() > 1 {
+                let mut title = format!("▶ Run all ({})", file.requests.len());
+                if let Some(last) = runs.get(&(uri.clone(), RUN_ALL_KEY.to_string())) {
+                    title.push_str(&format!(" · {}", last.title));
+                }
+                out.push(CodeLens {
+                    range,
+                    command: Some(Command {
+                        title,
+                        command: CMD_RUN_ALL.into(),
+                        arguments: Some(vec![json!(uri.as_str())]),
+                    }),
+                    data: None,
+                });
+            }
             out.push(CodeLens {
                 range,
                 command: Some(Command {
@@ -587,6 +656,14 @@ impl Server {
             if let Some(path) = last {
                 out.push(cmd("Open last response".into(), CMD_OPEN, vec![json!(path.to_string_lossy())]));
             }
+            let dir = self.root_for(&uri).join(&self.settings.responses_dir);
+            if runner::history(&dir, &runner::stem_for(req)).len() >= 2 {
+                out.push(cmd("Diff with previous response".into(), CMD_DIFF, vec![json!(uri.as_str()), json!(req.line)]));
+            }
+        }
+        if file.requests.len() > 1 {
+            let title = format!("Run all {} requests", file.requests.len());
+            out.push(cmd(title, CMD_RUN_ALL, vec![json!(uri.as_str())]));
         }
         let root = self.root_for(&uri);
         let current = self.env_name(&root);
@@ -665,13 +742,19 @@ impl Server {
                     self.open_document(Path::new(path), self.settings.focus_response);
                 }
             }
-            CMD_SEND | CMD_PREVIEW | CMD_CURL => {
+            CMD_RUN_ALL => {
+                if let Some(uri) = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok()) {
+                    self.run_all(uri);
+                }
+            }
+            CMD_SEND | CMD_PREVIEW | CMD_CURL | CMD_DIFF => {
                 let uri = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok());
                 let line = p.arguments.get(1).and_then(Value::as_u64).map(|l| l as usize);
                 if let (Some(uri), Some(line)) = (uri, line) {
                     match p.command.as_str() {
                         CMD_SEND => self.send(uri, line),
                         CMD_PREVIEW => self.preview(uri, line),
+                        CMD_DIFF => self.diff(uri, line),
                         _ => self.curl(uri, line),
                     }
                 }
@@ -712,6 +795,7 @@ impl Server {
             default_accept: self.settings.default_accept.clone(),
             insecure: self.settings.insecure || req.opts.insecure,
             follow_redirects: !req.opts.no_redirect,
+            history: self.settings.history_size,
         };
         let spec_path = spec.is_some().then(|| self.spec_path(uri, file)).flatten();
         Job {
@@ -739,7 +823,19 @@ impl Server {
             let spec = self.spec_for(uri, file);
             return Some(self.job(uri, file, &r, spec));
         }
-        let mut candidates: Vec<(Uri, String)> = self
+        for (u, text) in self.project_docs(uri) {
+            let other = http_parser::parse(&text);
+            if let Some(r) = other.named(name).cloned() {
+                let spec = self.spec_for(&u, &other);
+                return Some(self.job(&u, &other, &r, spec));
+            }
+        }
+        None
+    }
+
+    /// Other `.http` documents of the project: open buffers first, then files on disk.
+    fn project_docs(&self, uri: &Uri) -> Vec<(Uri, String)> {
+        let mut out: Vec<(Uri, String)> = self
             .docs
             .iter()
             .filter(|(u, _)| *u != uri)
@@ -748,19 +844,91 @@ impl Server {
         let responses = self.root_for(uri).join(&self.settings.responses_dir);
         for path in http_files(&self.root_for(uri)) {
             let u = path_to_uri(&path);
-            if path.starts_with(&responses) || u == *uri || candidates.iter().any(|(c, _)| *c == u) {
+            if path.starts_with(&responses) || u == *uri || out.iter().any(|(c, _)| *c == u) {
                 continue;
             }
             if let Ok(t) = std::fs::read_to_string(&path) {
-                candidates.push((u, t));
+                out.push((u, t));
             }
         }
-        for (u, text) in candidates {
-            let other = http_parser::parse(&text);
-            if let Some(r) = other.named(name).cloned() {
-                let spec = self.spec_for(&u, &other);
-                return Some(self.job(&u, &other, &r, spec));
+        out
+    }
+
+    fn definition(&mut self, p: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
+        let uri = p.text_document_position_params.text_document.uri;
+        let pos = p.text_document_position_params.position;
+        let (text, file, spec) = self.load(&uri)?;
+        let lines = split_lines(&text);
+        let line = *lines.get(pos.line as usize)?;
+        let col = lsp_to_byte(line, pos.character);
+        let at = |u: &Uri, l: usize, line_text: &str, needle: &str| {
+            let (s, e) = line_text.find(needle).map_or((0, line_text.len()), |s| (s, s + needle.len()));
+            let ls = [line_text];
+            let mut range = util::range_on_line(&ls, 0, s, e);
+            range.start.line = l as u32;
+            range.end.line = l as u32;
+            GotoDefinitionResponse::Scalar(Location { uri: u.clone(), range })
+        };
+
+        if let Some(name) = directive_arg(line, "auth").filter(|(_, s, e)| (*s..=*e).contains(&col)).map(|(n, ..)| n) {
+            let job = self.find_named(&uri, &file, &name)?;
+            let target = if job.uri == uri { text.clone() } else { std::fs::read_to_string(uri_to_path(&job.uri)?).ok()? };
+            let tl = split_lines(&target);
+            let l = (job.req.block_start..=job.req.line)
+                .find(|&i| directive_arg(tl[i], "name").is_some_and(|(n, ..)| n == name))
+                .unwrap_or(job.req.line);
+            return Some(at(&job.uri, l, tl[l], &name));
+        }
+
+        let (name, ..) = env::var_names_in(line).into_iter().find(|(_, s, e)| (*s..*e).contains(&col))?;
+        if name.starts_with('$') {
+            return None;
+        }
+        for (i, l) in lines.iter().enumerate() {
+            if http_parser::parse_var(l.trim()).is_some_and(|v| v.name == name) {
+                return Some(at(&uri, i, l, &name));
             }
+        }
+        let mut docs = vec![(uri.clone(), text.clone())];
+        docs.extend(self.project_docs(&uri));
+        for (u, t) in &docs {
+            for (i, l) in split_lines(t).iter().enumerate() {
+                if directive_arg(l, "capture").is_some_and(|(v, ..)| v.split('=').next().unwrap_or("").trim() == name) {
+                    return Some(at(u, i, l, &name));
+                }
+            }
+        }
+        let root = self.root_for(&uri);
+        let ctx = self.ctx_for(&uri, &file, spec.as_deref());
+        let key = format!("\"{name}\"");
+        let mut sources = Vec::new();
+        if ctx.captured.contains_key(&name) {
+            sources.push((root.join(".openapi/state.json"), Some(ctx.env_name.clone())));
+        }
+        if ctx.env.contains_key(&name) {
+            let user = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/zed/settings.json"));
+            for path in [Some(root.join(".zed/settings.json")), user].into_iter().flatten() {
+                sources.push((path.clone(), Some(ctx.env_name.clone())));
+                sources.push((path, None));
+            }
+        }
+        for (path, after) in sources {
+            let Ok(t) = std::fs::read_to_string(&path) else { continue };
+            let tl = split_lines(&t);
+            let from = after
+                .and_then(|a| tl.iter().position(|l| l.contains(&format!("\"{a}\""))))
+                .unwrap_or(0);
+            let is_key = |l: &str| l.find(&key).is_some_and(|k| l[k + key.len()..].trim_start().starts_with(':'));
+            if let Some(i) = (from..tl.len()).find(|&i| is_key(tl[i])) {
+                return Some(at(&path_to_uri(&path), i, tl[i], &key));
+            }
+        }
+        if name == "baseUrl" {
+            let path = self.spec_path(&uri, &file)?;
+            let t = std::fs::read_to_string(&path).ok()?;
+            let tl = split_lines(&t);
+            let i = tl.iter().position(|l| l.contains("\"servers\"") || l.trim_start().starts_with("servers:"))?;
+            return Some(at(&path_to_uri(&path), i, tl[i], "servers"));
         }
         None
     }
@@ -834,17 +1002,98 @@ impl Server {
         request::<CodeLensRefresh>(&self.sender, &self.next_id, ());
     }
 
+    fn bg(&self, open: bool) -> Bg {
+        Bg {
+            sender: self.sender.clone(),
+            runs: self.runs.clone(),
+            pending: self.pending_show.clone(),
+            next_id: self.next_id.clone(),
+            focus: self.settings.focus_response,
+            open,
+            responses_dir: self.settings.responses_dir.clone(),
+            republish: self.republish.clone(),
+        }
+    }
+
+    /// `@auth` login job for `req`; `Err` when the named request doesn't exist.
+    fn login_for(&mut self, uri: &Uri, file: &HttpFile, req: &http_parser::Request) -> Result<Option<Job>, String> {
+        match file.auth_for(req) {
+            Some(name) => self.find_named(uri, file, name).map(Some).ok_or(format!("@auth: no request named `{name}`")),
+            None => Ok(None),
+        }
+    }
+
+    fn run_all(&mut self, uri: Uri) {
+        let Some((_, file, spec)) = self.load(&uri) else { return };
+        let mut jobs = Vec::new();
+        for req in &file.requests {
+            let job = self.job(&uri, &file, req, spec.clone());
+            let login = self.login_for(&uri, &file, req);
+            jobs.push((job, login));
+        }
+        let total = jobs.len();
+        let bg = self.bg(false);
+        let key = (uri.clone(), RUN_ALL_KEY.to_string());
+        bg.set_lens(key.clone(), LastRun::note(format!("⏳ 0/{total}")));
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let (mut ok, mut failed) = (0, Vec::new());
+            for (i, (mut job, login)) in jobs.into_iter().enumerate() {
+                bg.set_lens(key.clone(), LastRun::note(format!("⏳ {}/{total}", i + 1)));
+                let label = job.label();
+                job.reload_captured();
+                let result = login.and_then(|mut login| {
+                    if let Some(l) = login.as_mut() {
+                        l.reload_captured();
+                    }
+                    bg.send(job.clone(), login)
+                });
+                match result {
+                    Ok(o) if o.status < 400 && o.checks.iter().all(|(_, f)| f.is_none()) => ok += 1,
+                    Ok(o) => failed.push(format!("{label} ({})", o.status)),
+                    Err(e) => {
+                        bg.set_lens(job.key(), LastRun::note(format!("✗ {}", util::one_line(&e, 60))));
+                        failed.push(label);
+                    }
+                }
+            }
+            let secs = started.elapsed().as_secs_f32();
+            let mut title = format!("✓ {ok}");
+            if !failed.is_empty() {
+                title = format!("✗ {} · {title}", failed.len());
+            }
+            title.push_str(&format!(" · {secs:.1} s"));
+            let msg = if failed.is_empty() {
+                format!("Run all: {ok}/{total} passed in {secs:.1} s")
+            } else {
+                format!("Run all: {ok}/{total} passed; failed: {}", failed.join(", "))
+            };
+            let typ = if failed.is_empty() { MessageType::INFO } else { MessageType::WARNING };
+            show(&bg.sender, typ, msg);
+            bg.set_lens(key, LastRun::note(title));
+        });
+    }
+
+    fn diff(&mut self, uri: Uri, line: usize) {
+        let Some((_, file, _)) = self.load(&uri) else { return };
+        let Some(req) = file.requests.iter().find(|r| r.line == line).or_else(|| file.request_at(line)) else {
+            return;
+        };
+        let dir = self.root_for(&uri).join(&self.settings.responses_dir);
+        match runner::write_diff(&dir, &runner::stem_for(req)) {
+            Ok(path) => self.open_document(&path, true),
+            Err(e) => show(&self.sender, MessageType::ERROR, format!("Diff: {e}")),
+        }
+    }
+
     fn send(&mut self, uri: Uri, line: usize) {
         let Some((job, file)) = self.job_at(&uri, line) else { return };
-        let login = match file.auth_for(&job.req) {
-            Some(name) => match self.find_named(&uri, &file, name) {
-                Some(l) => Some(l),
-                None => {
-                    show(&self.sender, MessageType::ERROR, format!("@auth: no request named `{name}`"));
-                    return;
-                }
-            },
-            None => None,
+        let login = match self.login_for(&uri, &file, &job.req) {
+            Ok(l) => l,
+            Err(e) => {
+                show(&self.sender, MessageType::ERROR, e);
+                return;
+            }
         };
         // Without @auth nothing can fill missing variables later, so fail right away.
         if login.as_ref().is_none_or(|l| !job.missing_captures(l)) {
@@ -853,20 +1102,13 @@ impl Server {
                 return;
             }
         }
-        let bg = Bg {
-            sender: self.sender.clone(),
-            runs: self.runs.clone(),
-            pending: self.pending_show.clone(),
-            next_id: self.next_id.clone(),
-            focus: self.settings.focus_response,
-            responses_dir: self.settings.responses_dir.clone(),
-        };
-        bg.set_lens(job.key(), LastRun { title: "⏳ sending…".into(), path: None });
+        let bg = self.bg(true);
+        bg.set_lens(job.key(), LastRun::note("⏳ sending…".into()));
         std::thread::spawn(move || {
             let key = job.key();
-            if let Err(e) = bg.send(job, login) {
+            if let Err(e) = bg.send(job, login).map(drop) {
                 show(&bg.sender, MessageType::ERROR, &e);
-                bg.set_lens(key, LastRun { title: format!("✗ {}", util::one_line(&e, 60)), path: None });
+                bg.set_lens(key, LastRun::note(format!("✗ {}", util::one_line(&e, 60))));
             }
         });
     }
@@ -970,6 +1212,7 @@ impl Server {
         let id = req.id.clone();
         let result = match req.method.as_str() {
             HoverRequest::METHOD => parse::<HoverParams>(req).map(|p| json!(self.hover(p))),
+            GotoDefinition::METHOD => parse::<GotoDefinitionParams>(req).map(|p| json!(self.definition(p))),
             Completion::METHOD => parse::<CompletionParams>(req).map(|p| {
                 json!(CompletionResponse::List(CompletionList { is_incomplete: false, items: self.completion(p) }))
             }),
@@ -988,6 +1231,19 @@ impl Server {
             Err(e) => Response::new_err(id, lsp_server::ErrorCode::InvalidParams as i32, e),
         }
     }
+}
+
+/// `# @<directive> <arg>` on `line`: (arg, arg_start, arg_end) byte offsets.
+fn directive_arg(line: &str, directive: &str) -> Option<(String, usize, usize)> {
+    let t = line.trim_start();
+    let c = t.strip_prefix('#').or_else(|| t.strip_prefix("//"))?.trim_start();
+    let rest = c.strip_prefix('@')?.strip_prefix(directive)?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let arg = rest.trim();
+    let start = line.find(arg)?;
+    (!arg.is_empty()).then(|| (arg.to_string(), start, start + arg.len()))
 }
 
 fn parse<P: serde::de::DeserializeOwned>(req: Request) -> Result<P, String> {
@@ -1042,6 +1298,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(["/", "{", "\"", "?", "&", ":", "@"].map(String::from).to_vec()),
             ..Default::default()
@@ -1049,7 +1306,7 @@ fn main() -> anyhow::Result<()> {
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV, CMD_CLEAR_COOKIES].map(String::from).to_vec(),
+            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV, CMD_CLEAR_COOKIES, CMD_RUN_ALL, CMD_DIFF].map(String::from).to_vec(),
             ..Default::default()
         }),
         ..Default::default()
@@ -1062,6 +1319,7 @@ fn main() -> anyhow::Result<()> {
         }),
     )?;
 
+    let (republish_tx, republish_rx) = crossbeam_channel::unbounded::<Uri>();
     let mut server = Server {
         sender: connection.sender.clone(),
         root,
@@ -1073,20 +1331,33 @@ fn main() -> anyhow::Result<()> {
         runs: Arc::new(Mutex::new(HashMap::new())),
         pending_show: Arc::new(Mutex::new(HashMap::new())),
         pending_env: HashMap::new(),
+        republish: republish_tx,
         next_id: Arc::new(AtomicU64::new(1)),
     };
 
-    for msg in &connection.receiver {
-        match msg {
-            Message::Request(req) => {
-                if connection.handle_shutdown(&req)? {
-                    break;
+    loop {
+        crossbeam_channel::select! {
+            recv(connection.receiver) -> msg => {
+                let Ok(msg) = msg else { break };
+                match msg {
+                    Message::Request(req) => {
+                        if connection.handle_shutdown(&req)? {
+                            break;
+                        }
+                        let resp = server.handle_request(req);
+                        connection.sender.send(Message::Response(resp))?;
+                    }
+                    Message::Notification(n) => server.handle_notification(n),
+                    Message::Response(r) => server.handle_response(r),
                 }
-                let resp = server.handle_request(req);
-                connection.sender.send(Message::Response(resp))?;
             }
-            Message::Notification(n) => server.handle_notification(n),
-            Message::Response(r) => server.handle_response(r),
+            recv(republish_rx) -> uri => {
+                if let Ok(uri) = uri {
+                    if server.docs.contains_key(&uri) {
+                        server.publish(&uri);
+                    }
+                }
+            }
         }
     }
     drop(server);

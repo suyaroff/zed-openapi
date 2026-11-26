@@ -2,7 +2,7 @@ use crate::env::{var_names_in, Ctx};
 use crate::http_parser::{HttpFile, Request};
 use crate::json_scan::{self, KeyTok};
 use crate::spec::{Match, PathElem, Spec};
-use crate::util::{range_on_line, split_lines};
+use crate::util::{full_line, range_on_line, split_lines};
 use lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use serde_json::Value;
 
@@ -26,6 +26,11 @@ pub fn compute(text: &str, file: &HttpFile, spec: Option<&Spec>, ctx: &Ctx) -> V
         .collect();
 
     for req in &file.requests {
+        for (line, e) in &req.opts.expects {
+            if let Err(msg) = crate::expect::parse(e) {
+                out.push(diag(full_line(&lines, *line), DiagnosticSeverity::WARNING, format!("@expect: {msg}")));
+            }
+        }
         if let Some(spec) = spec {
             check_request(&lines, req, spec, &mut out);
         }

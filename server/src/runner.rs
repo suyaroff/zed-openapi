@@ -18,6 +18,7 @@ pub struct Prepared {
     pub spec_path: Option<PathBuf>,
     /// The jar owns the `Cookie` header (the request didn't set one): recomputed on every hop.
     pub jar_cookie: bool,
+    pub expects: Vec<String>,
 }
 
 pub struct Outcome {
@@ -26,6 +27,8 @@ pub struct Outcome {
     pub elapsed: Duration,
     pub response_path: PathBuf,
     pub captured: Vec<(String, String)>,
+    /// (expression, failure) per `@expect`.
+    pub checks: Vec<(String, Option<String>)>,
 }
 
 #[derive(Clone)]
@@ -34,9 +37,11 @@ pub struct RunOptions {
     pub default_accept: Option<String>,
     pub insecure: bool,
     pub follow_redirects: bool,
+    /// Responses kept in `history/<stem>/`; 0 disables history.
+    pub history: usize,
 }
 
-fn stem_for(req: &Request) -> String {
+pub fn stem_for(req: &Request) -> String {
     let raw = match &req.name {
         Some(n) => n.clone(),
         None => {
@@ -152,6 +157,7 @@ pub fn prepare(
         stem: stem_for(req),
         spec_path: None,
         jar_cookie: false,
+        expects: req.opts.expects.iter().map(|(_, e)| ctx.substitute(e).unwrap_or_else(|_| e.clone())).collect(),
     })
 }
 
@@ -430,6 +436,23 @@ pub fn run(
     if !missed.is_empty() {
         let _ = writeln!(out, "# not captured: {}", missed.join(", "));
     }
+
+    let body_text = String::from_utf8_lossy(&resp.body);
+    let observed = crate::expect::Observed {
+        status: resp.status,
+        elapsed_ms: elapsed.as_millis(),
+        headers: &resp.headers,
+        json: parsed.as_ref(),
+        text: &body_text,
+    };
+    let checks = crate::expect::run_all(&p.expects, &observed);
+    for (e, failure) in &checks {
+        match failure {
+            None => writeln!(out, "# expect ✓ {e}"),
+            Some(f) => writeln!(out, "# expect ✗ {e} · {f}"),
+        }
+        .ok();
+    }
     out.push_str("#\n");
     out.push_str(&format_request(p));
 
@@ -453,14 +476,68 @@ pub fn run(
     }
 
     let response_path = responses_dir.join(format!("{}.http", p.stem));
-    std::fs::write(&response_path, out).map_err(|e| e.to_string())?;
+    std::fs::write(&response_path, &out).map_err(|e| e.to_string())?;
+    if opts.history > 0 {
+        save_history(responses_dir, &p.stem, &out, opts.history).map_err(|e| e.to_string())?;
+    }
     Ok(Outcome {
         status: resp.status,
         reason: resp.reason,
         elapsed,
         response_path,
         captured,
+        checks,
     })
+}
+
+pub fn history_dir(responses_dir: &Path, stem: &str) -> PathBuf {
+    responses_dir.join("history").join(stem)
+}
+
+/// History entries, oldest first (names are sortable timestamps).
+pub fn history(responses_dir: &Path, stem: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(history_dir(responses_dir, stem))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "http"))
+        .collect();
+    v.sort();
+    v
+}
+
+fn save_history(responses_dir: &Path, stem: &str, text: &str, keep: usize) -> std::io::Result<()> {
+    let dir = history_dir(responses_dir, stem);
+    std::fs::create_dir_all(&dir)?;
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let stamp = now_string().replace(['-', ':'], "").replace(" UTC", "").replace(' ', "-");
+    std::fs::write(dir.join(format!("{stamp}-{:03}.http", d.subsec_millis())), text)?;
+    let all = history(responses_dir, stem);
+    for old in &all[..all.len().saturating_sub(keep)] {
+        std::fs::remove_file(old)?;
+    }
+    Ok(())
+}
+
+/// Unified diff of the two latest history entries.
+pub fn write_diff(responses_dir: &Path, stem: &str) -> Result<PathBuf, String> {
+    let all = history(responses_dir, stem);
+    let [.., older, newer] = all.as_slice() else {
+        return Err("need at least two saved responses".into());
+    };
+    let read = |p: &PathBuf| std::fs::read_to_string(p).map_err(|e| e.to_string());
+    let (a, b) = (read(older)?, read(newer)?);
+    let name = |p: &PathBuf| p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let diff = similar::TextDiff::from_lines(&a, &b)
+        .unified_diff()
+        .context_radius(3)
+        .header(&name(older), &name(newer))
+        .to_string();
+    let text = if diff.is_empty() { format!("# {} and {} are identical\n", name(older), name(newer)) } else { diff };
+    let path = responses_dir.join(format!("{stem}.diff"));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 fn ensure_responses_dir(dir: &Path) -> Result<(), String> {
