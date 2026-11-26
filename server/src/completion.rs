@@ -370,10 +370,32 @@ fn request_line(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Ve
     if let Some(q) = typed.find('?') {
         let Some(op) = spec.find_exact(&req.method, &req.url) else { return Vec::new() };
         let start = req.url_start + typed.rfind(['?', '&']).unwrap_or(q) + 1;
-        return spec
-            .params(op)
-            .into_iter()
-            .filter(|p| p.get("in").and_then(Value::as_str) == Some("query"))
+        let line = cx.lines[cx.line];
+        let token = &line[start..cx.col];
+        let params = spec.params(op).into_iter().filter(|p| p.get("in").and_then(Value::as_str) == Some("query"));
+        if let Some((name, _)) = token.split_once('=') {
+            let vstart = start + name.len() + 1;
+            let vend = cx.col + line[cx.col..].find(['&', '#', ' ']).unwrap_or(line.len() - cx.col);
+            let Some(p) = params.into_iter().find(|p| p.get("name").and_then(Value::as_str) == Some(name)) else {
+                return Vec::new();
+            };
+            return query_values(spec, p)
+                .into_iter()
+                .map(|v| CompletionItem {
+                    label: v.clone(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    text_edit: cx.edit(vstart, vend, v),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        let mut used: Vec<&str> = req.url.split_once('?').map_or("", |(_, q)| q).split('&').collect();
+        if let Some(i) = used.iter().position(|u| *u == token) {
+            used.remove(i);
+        }
+        let used: Vec<&str> = used.iter().map(|u| u.split('=').next().unwrap_or("")).collect();
+        return params
+            .filter(|p| p.get("name").and_then(Value::as_str).is_some_and(|n| !used.contains(&n)))
             .map(|p| {
                 let name = p.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                 CompletionItem {
@@ -395,7 +417,7 @@ fn request_line(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Ve
     } else {
         0
     };
-    let start = req.url_start + prefix_len;
+    let start = req.url_start + prefix_len + path_cut(spec, &typed[prefix_len..]);
     let end = req.url_start + req.url.find('?').unwrap_or(req.url.len()).min(cx.lines[cx.line].len() - req.url_start);
     let end = end.max(cx.col);
     let mut seen = BTreeSet::new();
@@ -423,6 +445,47 @@ fn request_line(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Ve
         .collect()
 }
 
+/// Offset in the typed path where the spec path begins; a base path in front
+/// (`/api/v3` from `servers`, or typed by hand) stays in place.
+fn path_cut(spec: &Spec, typed: &str) -> usize {
+    let matches = |op_path: &str, t: &str| {
+        let (t, o): (Vec<&str>, Vec<&str>) = (t.split('/').collect(), op_path.split('/').collect());
+        t.len() <= o.len()
+            && t.iter().zip(&o).enumerate().all(|(i, (ts, os))| {
+                os.starts_with('{') || if i == t.len() - 1 { os.starts_with(ts) } else { ts == os }
+            })
+    };
+    if let Some(i) = typed.match_indices('/').map(|(i, _)| i).find(|&i| spec.ops.iter().any(|op| matches(&op.path, &typed[i..]))) {
+        return i;
+    }
+    let base = spec.base_url().unwrap_or_default();
+    let base = match base.find("://") {
+        Some(i) => base[i + 3..].find('/').map_or("", |j| &base[i + 3 + j..]),
+        None => base.as_str(),
+    };
+    if !base.is_empty() && typed.starts_with(base) && typed[base.len()..].starts_with('/') {
+        return base.len();
+    }
+    0
+}
+
+/// Suggested values of a query parameter: its enum (or the enum of its array items), or booleans.
+fn query_values(spec: &Spec, p: &Value) -> Vec<String> {
+    let Some(schema) = p.get("schema").map(|s| spec.resolve(s)) else { return Vec::new() };
+    let schema = match schema.get("items") {
+        Some(items) if schema.get("type").and_then(Value::as_str) == Some("array") => spec.resolve(items),
+        _ => schema,
+    };
+    if schema.get("type").and_then(Value::as_str) == Some("boolean") {
+        return vec!["true".into(), "false".into()];
+    }
+    schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .map(|e| e.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 fn header(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Vec<CompletionItem> {
     let op = spec.and_then(|s| s.find_exact(&req.method, &req.url).map(|o| (s, o)));
     let lead = before.len() - before.trim_start().len();
@@ -439,6 +502,7 @@ fn header(cx: &Cx, req: &Request, before: &str, spec: Option<&Spec>) -> Vec<Comp
                     }
                 }
             }
+            names.retain(|(n, _)| !req.headers.iter().any(|h| h.line != cx.line && h.name.eq_ignore_ascii_case(n)));
             names
                 .into_iter()
                 .map(|(name, doc)| CompletionItem {
