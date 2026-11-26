@@ -4,6 +4,7 @@ mod env;
 mod http_parser;
 mod json_scan;
 mod render;
+mod response;
 mod runner;
 mod spec;
 mod util;
@@ -16,7 +17,7 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, CodeLensRefresh, CodeLensRequest, Completion, ExecuteCommand, HoverRequest,
-    Request as _, ShowDocument, WorkspaceConfiguration,
+    Request as _, ShowDocument, ShowMessageRequest, WorkspaceConfiguration,
 };
 use lsp_types::*;
 use serde::Deserialize;
@@ -35,6 +36,8 @@ use crate::util::{lsp_to_byte, path_to_uri, split_lines, uri_to_path};
 const CMD_SEND: &str = "openapi.send";
 const CMD_OPEN: &str = "openapi.openResponse";
 const CMD_PREVIEW: &str = "openapi.preview";
+const CMD_CURL: &str = "openapi.curl";
+const CMD_ENV: &str = "openapi.selectEnv";
 
 struct PreparedAt {
     prepared: runner::Prepared,
@@ -42,6 +45,7 @@ struct PreparedAt {
     root: PathBuf,
     env_name: String,
     key: String,
+    spec: Option<Arc<Spec>>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -105,6 +109,8 @@ struct Server {
     discovered: Option<Option<PathBuf>>,
     runs: Arc<Mutex<HashMap<(Uri, String), LastRun>>>,
     pending_show: Arc<Mutex<HashMap<RequestId, PathBuf>>>,
+    /// `window/showMessageRequest` env pickers awaiting an answer, keyed to the project root.
+    pending_env: HashMap<RequestId, PathBuf>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -223,7 +229,7 @@ impl Server {
     fn ctx_for(&self, uri: &Uri, file: &HttpFile, spec: Option<&Spec>) -> Ctx {
         let root = self.root_for(uri);
         let (env_name, env) = env::load_env(
-            self.settings.env.as_deref(),
+            self.wanted_env(&root).as_deref(),
             &self.settings.vars,
             &self.settings.envs,
         );
@@ -236,6 +242,16 @@ impl Server {
         }
     }
 
+    fn wanted_env(&self, root: &Path) -> Option<String> {
+        env::load_selected(root)
+            .filter(|e| self.settings.envs.contains_key(e))
+            .or_else(|| self.settings.env.clone())
+    }
+
+    fn env_name(&self, root: &Path) -> String {
+        env::load_env(self.wanted_env(root).as_deref(), &Default::default(), &self.settings.envs).0
+    }
+
     fn load(&mut self, uri: &Uri) -> Option<(String, HttpFile, Option<Arc<Spec>>)> {
         let text = self.docs.get(uri)?.clone();
         let file = http_parser::parse(&text);
@@ -246,7 +262,12 @@ impl Server {
     fn publish(&mut self, uri: &Uri) {
         let Some((text, file, spec)) = self.load(uri) else { return };
         let ctx = self.ctx_for(uri, &file, spec.as_deref());
-        let diagnostics = diagnostics::compute(&text, &file, spec.as_deref(), &ctx);
+        let mut diagnostics = diagnostics::compute(&text, &file, spec.as_deref(), &ctx);
+        if file.requests.is_empty() {
+            if let Some(spec) = spec.as_deref() {
+                diagnostics.extend(response::diagnostics(&text, spec));
+            }
+        }
         notify::<PublishDiagnostics>(
             &self.sender,
             PublishDiagnosticsParams { uri: uri.clone(), diagnostics, version: None },
@@ -337,10 +358,22 @@ impl Server {
         let Some(text) = self.docs.get(&uri) else { return Vec::new() };
         let lines = split_lines(text);
         let file = http_parser::parse(text);
+        let env_lens = (!self.settings.envs.is_empty()).then(|| self.env_name(&self.root_for(&uri)));
         let runs = self.runs.lock().unwrap();
         let mut out = Vec::new();
-        for req in &file.requests {
+        for (i, req) in file.requests.iter().enumerate() {
             let range = util::full_line(&lines, req.line);
+            if let Some(env) = env_lens.as_ref().filter(|_| i == 0) {
+                out.push(CodeLens {
+                    range,
+                    command: Some(Command {
+                        title: format!("env: {env}"),
+                        command: CMD_ENV.into(),
+                        arguments: Some(vec![json!(uri.as_str())]),
+                    }),
+                    data: None,
+                });
+            }
             out.push(CodeLens {
                 range,
                 command: Some(Command {
@@ -379,15 +412,30 @@ impl Server {
             }),
             ..Default::default()
         })];
-        out.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Preview request".into(),
-            command: Some(Command {
-                title: "Preview request".into(),
-                command: CMD_PREVIEW.into(),
-                arguments: Some(vec![json!(uri.as_str()), json!(req.line)]),
-            }),
-            ..Default::default()
-        }));
+        for (title, cmd) in [("Preview request", CMD_PREVIEW), ("Show as curl", CMD_CURL)] {
+            out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                command: Some(Command {
+                    title: title.into(),
+                    command: cmd.into(),
+                    arguments: Some(vec![json!(uri.as_str()), json!(req.line)]),
+                }),
+                ..Default::default()
+            }));
+        }
+        let current = self.env_name(&self.root_for(&uri));
+        for name in self.settings.envs.keys().filter(|n| **n != current) {
+            let title = format!("Switch env to {name}");
+            out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.clone(),
+                command: Some(Command {
+                    title,
+                    command: CMD_ENV.into(),
+                    arguments: Some(vec![json!(uri.as_str()), json!(name)]),
+                }),
+                ..Default::default()
+            }));
+        }
         if let Some(path) = self
             .runs
             .lock()
@@ -429,15 +477,26 @@ impl Server {
                     self.open_document(Path::new(path), self.settings.focus_response);
                 }
             }
-            CMD_SEND | CMD_PREVIEW => {
+            CMD_SEND | CMD_PREVIEW | CMD_CURL => {
                 let uri = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok());
                 let line = p.arguments.get(1).and_then(Value::as_u64).map(|l| l as usize);
                 if let (Some(uri), Some(line)) = (uri, line) {
-                    if p.command == CMD_SEND {
-                        self.send(uri, line);
-                    } else {
-                        self.preview(uri, line);
+                    match p.command.as_str() {
+                        CMD_SEND => self.send(uri, line),
+                        CMD_PREVIEW => self.preview(uri, line),
+                        _ => self.curl(uri, line),
                     }
+                }
+            }
+            CMD_ENV => {
+                let Some(uri) = p.arguments.first().and_then(Value::as_str).and_then(|s| s.parse::<Uri>().ok())
+                else {
+                    return;
+                };
+                let root = self.root_for(&uri);
+                match p.arguments.get(1).and_then(Value::as_str) {
+                    Some(name) => self.select_env(&root, name),
+                    None => self.prompt_env(root),
                 }
             }
             other => log(&self.sender, format!("unknown command {other}")),
@@ -457,8 +516,14 @@ impl Server {
             default_accept: self.settings.default_accept.clone(),
             insecure: self.settings.insecure,
         };
+        let key = req.key();
         match runner::prepare(req, &ctx, spec.as_deref(), &base_dir, &opts) {
-            Ok(prepared) => Some(PreparedAt { prepared, opts, root, env_name: ctx.env_name, key: req.key() }),
+            Ok(mut prepared) => {
+                if spec.is_some() {
+                    prepared.spec_path = self.spec_path(uri, &file);
+                }
+                Some(PreparedAt { prepared, opts, root, env_name: ctx.env_name, key, spec })
+            }
             Err(e) => {
                 show(&self.sender, MessageType::ERROR, format!("Request not sent: {e}"));
                 None
@@ -475,8 +540,62 @@ impl Server {
         }
     }
 
+    fn curl(&mut self, uri: Uri, line: usize) {
+        let Some(p) = self.prepare_at(&uri, line) else { return };
+        let dir = p.root.join(&self.settings.responses_dir);
+        match runner::write_curl(&p.prepared, &p.opts, &dir) {
+            Ok(path) => self.open_document(&path, true),
+            Err(e) => show(&self.sender, MessageType::ERROR, format!("curl export failed: {e}")),
+        }
+    }
+
+    fn prompt_env(&mut self, root: PathBuf) {
+        let current = self.env_name(&root);
+        let actions = self
+            .settings
+            .envs
+            .keys()
+            .map(|k| MessageActionItem {
+                title: if *k == current { format!("{k} ✓") } else { k.clone() },
+                properties: Default::default(),
+            })
+            .collect();
+        let id = request::<ShowMessageRequest>(
+            &self.sender,
+            &self.next_id,
+            ShowMessageRequestParams {
+                typ: MessageType::INFO,
+                message: format!("OpenAPI env (current: {current})"),
+                actions: Some(actions),
+            },
+        );
+        self.pending_env.insert(id, root);
+    }
+
+    fn select_env(&mut self, root: &Path, name: &str) {
+        let name = name.trim_end_matches(" ✓");
+        if !self.settings.envs.contains_key(name) {
+            show(&self.sender, MessageType::ERROR, format!("Unknown env `{name}`"));
+            return;
+        }
+        if let Err(e) = env::save_selected(root, Some(name)) {
+            show(&self.sender, MessageType::ERROR, format!("Cannot save env: {e}"));
+            return;
+        }
+        log(&self.sender, format!("env: {name}"));
+        self.refresh_all();
+    }
+
+    fn refresh_all(&mut self) {
+        let uris: Vec<Uri> = self.docs.keys().cloned().collect();
+        for uri in uris {
+            self.publish(&uri);
+        }
+        request::<CodeLensRefresh>(&self.sender, &self.next_id, ());
+    }
+
     fn send(&mut self, uri: Uri, line: usize) {
-        let Some(PreparedAt { prepared, opts, root, env_name, key }) = self.prepare_at(&uri, line) else {
+        let Some(PreparedAt { prepared, opts, root, env_name, key, spec }) = self.prepare_at(&uri, line) else {
             return;
         };
         let key = (uri, key);
@@ -499,6 +618,13 @@ impl Server {
                     if !o.captured.is_empty() {
                         let names: Vec<&str> = o.captured.iter().map(|(k, _)| k.as_str()).collect();
                         title.push_str(&format!(" · captured {}", names.join(", ")));
+                    }
+                    let issues = spec.as_deref().zip(std::fs::read_to_string(&o.response_path).ok()).map_or(
+                        0,
+                        |(spec, text)| response::warning_count(&text, spec),
+                    );
+                    if issues > 0 {
+                        title.push_str(&format!(" · ⚠ {issues} spec"));
                     }
                     let id = request::<ShowDocument>(
                         &sender,
@@ -524,6 +650,16 @@ impl Server {
     }
 
     fn handle_response(&mut self, resp: Response) {
+        if let Some(root) = self.pending_env.remove(&resp.id) {
+            let picked = resp
+                .response_result
+                .ok()
+                .and_then(|r| serde_json::from_value::<Option<MessageActionItem>>(r).ok().flatten());
+            if let Some(item) = picked {
+                self.select_env(&root, &item.title);
+            }
+            return;
+        }
         let path = self.pending_show.lock().unwrap().remove(&resp.id);
         let Some(path) = path else {
             if resp.id.to_string().contains("cfg") {
@@ -551,12 +687,14 @@ impl Server {
 
     fn update_settings(&mut self, s: Settings) {
         log(&self.sender, format!("settings: {s:?}"));
+        if s.env != self.settings.env {
+            if let Some(root) = &self.root {
+                let _ = env::save_selected(root, None);
+            }
+        }
         self.settings = s;
         self.discovered = None;
-        let uris: Vec<Uri> = self.docs.keys().cloned().collect();
-        for uri in uris {
-            self.publish(&uri);
-        }
+        self.refresh_all();
     }
 
     fn handle_notification(&mut self, n: Notification) {
@@ -689,7 +827,7 @@ fn main() -> anyhow::Result<()> {
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![CMD_SEND.into(), CMD_OPEN.into(), CMD_PREVIEW.into()],
+            commands: [CMD_SEND, CMD_OPEN, CMD_PREVIEW, CMD_CURL, CMD_ENV].map(String::from).to_vec(),
             ..Default::default()
         }),
         ..Default::default()
@@ -712,6 +850,7 @@ fn main() -> anyhow::Result<()> {
         discovered: None,
         runs: Arc::new(Mutex::new(HashMap::new())),
         pending_show: Arc::new(Mutex::new(HashMap::new())),
+        pending_env: HashMap::new(),
         next_id: Arc::new(AtomicU64::new(1)),
     };
 

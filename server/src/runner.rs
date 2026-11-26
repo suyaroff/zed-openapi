@@ -13,6 +13,7 @@ pub struct Prepared {
     pub body: Option<Vec<u8>>,
     pub captures: Vec<(String, String)>,
     pub stem: String,
+    pub spec_path: Option<PathBuf>,
 }
 
 pub struct Outcome {
@@ -143,6 +144,7 @@ pub fn prepare(
         body,
         captures: req.captures.clone(),
         stem: stem_for(req),
+        spec_path: None,
     })
 }
 
@@ -362,6 +364,9 @@ pub fn run(
     for r in &resp.redirects {
         let _ = writeln!(out, "# redirect: {r}");
     }
+    if let Some(spec) = &p.spec_path {
+        let _ = writeln!(out, "# @spec {}", spec.display());
+    }
 
     let parsed: Option<Value> = if ct.contains("json") || ct.is_empty() {
         serde_json::from_slice(&resp.body).ok()
@@ -477,6 +482,46 @@ pub fn write_preview(p: &Prepared, responses_dir: &Path, env_name: &str) -> Resu
     out.push_str(&format_request(p));
     let path = responses_dir.join(format!("{}.preview.http", p.stem));
     std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+pub fn write_curl(p: &Prepared, opts: &RunOptions, responses_dir: &Path) -> Result<PathBuf, String> {
+    ensure_responses_dir(responses_dir)?;
+    let mut args = vec!["curl".to_string()];
+    if opts.insecure {
+        args.push("-k".into());
+    }
+    // Same-host redirects keep POST and its body, as in `execute`.
+    args.push("-L".into());
+    if p.method == "POST" {
+        args.extend(["--post301".into(), "--post302".into()]);
+    }
+    match p.method.as_str() {
+        "HEAD" => args.push("-I".into()),
+        "GET" if p.body.is_none() => {}
+        "POST" if p.body.is_some() => {}
+        m => args.push(format!("-X {m}")),
+    }
+    args.push(shell_quote(&p.url));
+    for (k, v) in &p.headers {
+        args.push(format!("-H {}", shell_quote(&format!("{k}: {v}"))));
+    }
+    if let Some(body) = &p.body {
+        match std::str::from_utf8(body) {
+            Ok(text) => args.push(format!("--data-raw {}", shell_quote(text))),
+            Err(_) => {
+                let file = responses_dir.join(format!("{}.body", p.stem));
+                std::fs::write(&file, body).map_err(|e| e.to_string())?;
+                args.push(format!("--data-binary @{}", shell_quote(&file.to_string_lossy())));
+            }
+        }
+    }
+    let path = responses_dir.join(format!("{}.curl.sh", p.stem));
+    std::fs::write(&path, args.join(" \\\n  ") + "\n").map_err(|e| e.to_string())?;
     Ok(path)
 }
 

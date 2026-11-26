@@ -169,3 +169,136 @@ pub fn neutralize_vars(text: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// Strict JSON tree with byte spans, for pointing diagnostics at exact keys and values.
+#[derive(Debug)]
+pub struct Node {
+    pub start: usize,
+    pub end: usize,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug)]
+pub enum NodeKind {
+    /// (key, key_start, key_end, value)
+    Object(Vec<(String, usize, usize, Node)>),
+    Array(Vec<Node>),
+    Scalar(serde_json::Value),
+}
+
+pub fn parse_spanned(text: &str) -> Option<Node> {
+    let mut p = SpanParser { s: text.as_bytes(), text, i: 0 };
+    let node = p.value(0)?;
+    p.ws();
+    (p.i == p.s.len()).then_some(node)
+}
+
+struct SpanParser<'a> {
+    s: &'a [u8],
+    text: &'a str,
+    i: usize,
+}
+
+impl SpanParser<'_> {
+    fn ws(&mut self) {
+        while self.s.get(self.i).is_some_and(u8::is_ascii_whitespace) {
+            self.i += 1;
+        }
+    }
+
+    fn string_end(&self, start: usize) -> Option<usize> {
+        let mut j = start + 1;
+        while j < self.s.len() {
+            match self.s[j] {
+                b'\\' => j += 2,
+                b'"' => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+        None
+    }
+
+    fn value(&mut self, depth: usize) -> Option<Node> {
+        if depth > 256 {
+            return None;
+        }
+        self.ws();
+        let start = self.i;
+        let kind = match *self.s.get(self.i)? {
+            b'{' => {
+                self.i += 1;
+                let mut fields = Vec::new();
+                self.ws();
+                if self.s.get(self.i) == Some(&b'}') {
+                    self.i += 1;
+                } else {
+                    loop {
+                        self.ws();
+                        if self.s.get(self.i) != Some(&b'"') {
+                            return None;
+                        }
+                        let ks = self.i;
+                        let ke = self.string_end(ks)?;
+                        let key: String = serde_json::from_str(&self.text[ks..ke]).ok()?;
+                        self.i = ke;
+                        self.ws();
+                        if self.s.get(self.i) != Some(&b':') {
+                            return None;
+                        }
+                        self.i += 1;
+                        let v = self.value(depth + 1)?;
+                        fields.push((key, ks, ke, v));
+                        self.ws();
+                        match self.s.get(self.i)? {
+                            b',' => self.i += 1,
+                            b'}' => {
+                                self.i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                NodeKind::Object(fields)
+            }
+            b'[' => {
+                self.i += 1;
+                let mut items = Vec::new();
+                self.ws();
+                if self.s.get(self.i) == Some(&b']') {
+                    self.i += 1;
+                } else {
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        self.ws();
+                        match self.s.get(self.i)? {
+                            b',' => self.i += 1,
+                            b']' => {
+                                self.i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                NodeKind::Array(items)
+            }
+            b'"' => {
+                let end = self.string_end(start)?;
+                self.i = end;
+                NodeKind::Scalar(serde_json::from_str(&self.text[start..end]).ok()?)
+            }
+            _ => {
+                while self
+                    .s
+                    .get(self.i)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'+' | b'.'))
+                {
+                    self.i += 1;
+                }
+                NodeKind::Scalar(serde_json::from_str(self.text.get(start..self.i)?).ok()?)
+            }
+        };
+        Some(Node { start, end: self.i, kind })
+    }
+}

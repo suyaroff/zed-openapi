@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_FILE: &str = ".openapi/state.json";
+const SELECTED_ENV_FILE: &str = ".openapi/env";
 
 #[derive(Default)]
 pub struct Ctx {
@@ -191,14 +192,40 @@ pub fn save_captured(root: &Path, env: &str, values: &[(String, String)]) -> std
             obj.insert(k.clone(), Value::String(v.clone()));
         }
     }
-    if let Some(dir) = path.parent() {
+    ensure_state_dir(&path)?;
+    std::fs::write(path, serde_json::to_string_pretty(&Value::Object(state))?)
+}
+
+fn ensure_state_dir(file: &Path) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
         let ignore = dir.join(".gitignore");
         if !ignore.exists() {
             std::fs::write(ignore, "*\n")?;
         }
     }
-    std::fs::write(path, serde_json::to_string_pretty(&Value::Object(state))?)
+    Ok(())
+}
+
+/// Env picked via the `env` code lens; overrides the `env` setting until that setting changes.
+pub fn load_selected(root: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(root.join(SELECTED_ENV_FILE)).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+pub fn save_selected(root: &Path, env: Option<&str>) -> std::io::Result<()> {
+    let path = root.join(SELECTED_ENV_FILE);
+    match env {
+        Some(e) => {
+            ensure_state_dir(&path)?;
+            std::fs::write(path, format!("{e}\n"))
+        }
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
 }
 
 /// `data.items.0.id` style lookup.
